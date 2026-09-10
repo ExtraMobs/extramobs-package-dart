@@ -10,6 +10,8 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  mssql:
+    path: packages/mssql
   plugin_platform_interface: ^2.0.2
 
 dev_dependencies:
