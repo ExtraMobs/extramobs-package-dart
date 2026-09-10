@@ -1,0 +1,4 @@
+[submodule "packages/mssql"]
+	path = packages/mssql
+	url = ./
+	branch = packages/mssql
