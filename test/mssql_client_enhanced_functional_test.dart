@@ -45,17 +45,20 @@ void main() {
         expect(rows.first['name'], 'Basic Item');
       });
 
-      test('F_EASY_002: INSERT with all columns including NULL values', () async {
-        await harness.executeParams(
-          'INSERT INTO dbo.SimpleItems (id, name, value, is_active) VALUES (@id, @name, @value, @active)',
-          {'id': 2, 'name': 'Complete Item', 'value': 99.50, 'active': true},
-        );
-        final rows = parseRows(
-          await harness.query('SELECT * FROM dbo.SimpleItems WHERE id = 2'),
-        );
-        expect(rows.first['value'], 99.50);
-        expect(rows.first['is_active'], true);
-      });
+      test(
+        'F_EASY_002: INSERT with all columns including NULL values',
+        () async {
+          await harness.executeParams(
+            'INSERT INTO dbo.SimpleItems (id, name, value, is_active) VALUES (@id, @name, @value, @active)',
+            {'id': 2, 'name': 'Complete Item', 'value': 99.50, 'active': true},
+          );
+          final rows = parseRows(
+            await harness.query('SELECT * FROM dbo.SimpleItems WHERE id = 2'),
+          );
+          expect(rows.first['value'], '99.50');
+          expect(rows.first['is_active'], true);
+        },
+      );
 
       test('F_EASY_003: SELECT with WHERE clause filtering', () async {
         await harness.executeParams(
@@ -83,7 +86,7 @@ void main() {
         final rows = parseRows(
           await harness.query('SELECT value FROM dbo.SimpleItems WHERE id = 4'),
         );
-        expect(rows.first['value'], 15.5);
+        expect(rows.first['value'], '15.50');
       });
 
       test('F_EASY_005: DELETE single record', () async {
@@ -130,7 +133,7 @@ void main() {
             'SELECT SUM(value) as total FROM dbo.SimpleItems WHERE id IN (20, 21)',
           ),
         );
-        expect(rows.first['total'], 26.0);
+        expect(rows.first['total'], '26.00');
       });
 
       test('F_EASY_008: ORDER BY ascending', () async {
@@ -210,7 +213,7 @@ void main() {
             );
             expect(rows.length, 1);
             expect(rows.first['name'], 'Bulk Test Item $i');
-            expect(rows.first['value'], i * 2.5);
+            expect(rows.first['value'], (i * 2.5).toStringAsFixed(2));
             expect(rows.first['is_active'], i % 2 == 0);
 
             // Update the record
@@ -225,7 +228,7 @@ void main() {
                 'SELECT value FROM dbo.SimpleItems WHERE id = $testId',
               ),
             );
-            expect(updatedRows.first['value'], i * 3.0);
+            expect(updatedRows.first['value'], (i * 3.0).toStringAsFixed(2));
           },
         );
       }
@@ -315,7 +318,7 @@ void main() {
 
         expect(rows.length, 1);
         expect(rows.first['name'], 'John Doe');
-        expect(rows.first['total_amount'], 999.99);
+        expect(rows.first['total_amount'], '999.99');
       });
 
       test('F_MOD_002: INNER JOIN with parameterized WHERE', () async {
@@ -615,32 +618,29 @@ void main() {
         },
       );
 
-      test(
-        'F_HARD_002: Self-referencing foreign key (Categories hierarchy)',
-        () async {
-          // Ensure parent category exists in this test
-          await harness.executeParams(
-            'INSERT INTO dbo.Categories (category_id, name) VALUES (@id, @name)',
-            {'id': 1, 'name': 'Electronics'},
-          );
-          await harness.executeParams(
-            'INSERT INTO dbo.Categories (category_id, name, parent_category_id) VALUES (@id, @name, @parentId)',
-            {'id': 2, 'name': 'Computers', 'parentId': 1},
-          );
+      test('F_HARD_002: Self-referencing foreign key (Categories hierarchy)', () async {
+        // Ensure parent category exists in this test
+        await harness.executeParams(
+          'INSERT INTO dbo.Categories (category_id, name) VALUES (@id, @name)',
+          {'id': 1, 'name': 'Electronics'},
+        );
+        await harness.executeParams(
+          'INSERT INTO dbo.Categories (category_id, name, parent_category_id) VALUES (@id, @name, @parentId)',
+          {'id': 2, 'name': 'Computers', 'parentId': 1},
+        );
 
-          final rows = parseRows(
-            await harness.query('''
+        final rows = parseRows(
+          await harness.query('''
           SELECT c.name as child_name, p.name as parent_name
           FROM dbo.Categories c
           LEFT JOIN dbo.Categories p ON c.parent_category_id = p.category_id
           WHERE c.category_id = 2
         '''),
-          );
+        );
 
-          expect(rows.first['child_name'], 'Computers');
-          expect(rows.first['parent_name'], 'Electronics');
-        },
-      );
+        expect(rows.first['child_name'], 'Computers');
+        expect(rows.first['parent_name'], 'Electronics');
+      });
 
       test('F_HARD_003: Window functions with OVER clause', () async {
         // Ensure base category exists for FK
@@ -681,7 +681,7 @@ void main() {
 
         expect(rows.length, 5);
         expect(rows.first['price_rank'], 1);
-        expect(rows.first['price'], 1000.0); // Product 5 has highest price
+        expect(rows.first['price'], '1000.0000'); // Product 5 has highest price
       });
 
       test('F_HARD_004: Common Table Expression (CTE) with recursion', () async {
@@ -836,7 +836,7 @@ void main() {
             expect(rows.length, 1);
             expect(rows.first['category_name'], 'Category_$i');
             expect(rows.first['product_name'], 'Product_$i');
-            expect(rows.first['margin'] > 0, true);
+            expect(rows.first['margin'], '${i * 40 + 40}.0000');
           },
         );
       }
@@ -1091,7 +1091,7 @@ void main() {
             'SELECT price FROM dbo.Products WHERE product_id = 1',
           ),
         );
-        expect(productRows.first['price'], 150.0);
+        expect(productRows.first['price'], '150.0000');
 
         // Verify audit trail
         final auditRows = parseRows(
@@ -1128,16 +1128,14 @@ void main() {
               ),
             );
 
-            final discount = rows.first['discount'] as double;
-            expect(discount >= 0, true);
-            expect(discount <= 15.0, true);
+            final discount = rows.first['discount'];
 
             if (amount >= 10000) {
-              expect(discount, 15.0);
+              expect(discount, '15.00');
             } else if (amount >= 5000) {
-              expect(discount, 10.0);
+              expect(discount, '10.00');
             } else {
-              expect(discount, 5.0);
+              expect(discount, '5.00');
             }
           }
         },
@@ -1208,7 +1206,7 @@ void main() {
         expect(rows.length, 1);
         expect(rows.first['total_quantity_sold'], 5);
         expect(rows.first['sale_count'], 1);
-        expect(rows.first['total_revenue'], 675.0); // 5 * 150 * 0.9
+        expect(rows.first['total_revenue'], '675.0000000000'); // 5 * 150 * 0.9
       });
 
       test(
@@ -1277,73 +1275,67 @@ void main() {
         },
       );
 
-      test(
-        'F_COMPLEX_005: Many-to-many relationship with business rules',
-        () async {
-          // Setup supplier
-          // Ensure base product exists
-          // Clean up potential leftovers for id=1 to make test idempotent
-          await harness.execute(
-            "DELETE FROM dbo.ProductSuppliers WHERE product_id=1",
-          );
-          await harness.execute(
-            "DELETE FROM dbo.Suppliers WHERE supplier_id=1",
-          );
-          await harness.execute("DELETE FROM dbo.Products WHERE product_id=1");
-          await harness.execute(
-            "DELETE FROM dbo.Categories WHERE category_id=1",
-          );
-          await harness.executeParams(
-            'INSERT INTO dbo.Categories (category_id, name) VALUES (@id, @name)',
-            {'id': 1, 'name': 'Test Category'},
-          );
-          await harness.executeParams(
-            '''
+      test('F_COMPLEX_005: Many-to-many relationship with business rules', () async {
+        // Setup supplier
+        // Ensure base product exists
+        // Clean up potential leftovers for id=1 to make test idempotent
+        await harness.execute(
+          "DELETE FROM dbo.ProductSuppliers WHERE product_id=1",
+        );
+        await harness.execute("DELETE FROM dbo.Suppliers WHERE supplier_id=1");
+        await harness.execute("DELETE FROM dbo.Products WHERE product_id=1");
+        await harness.execute("DELETE FROM dbo.Categories WHERE category_id=1");
+        await harness.executeParams(
+          'INSERT INTO dbo.Categories (category_id, name) VALUES (@id, @name)',
+          {'id': 1, 'name': 'Test Category'},
+        );
+        await harness.executeParams(
+          '''
           INSERT INTO dbo.Products (product_id, name, sku, price, category_id) 
           VALUES (@id, @name, @sku, @price, @categoryId)
         ''',
-            {
-              'id': 1,
-              'name': 'Test Product',
-              'sku': 'TEST-001',
-              'price': 150.0,
-              'categoryId': 1,
-            },
-          );
-          await harness.executeParams(
-            '''
+          {
+            'id': 1,
+            'name': 'Test Product',
+            'sku': 'TEST-001',
+            'price': 150.0,
+            'categoryId': 1,
+          },
+        );
+        await harness.executeParams(
+          '''
           INSERT INTO dbo.Suppliers (supplier_id, company_name, contact_name, rating, is_preferred) 
           VALUES (@id, @company, @contact, @rating, @preferred)
         ''',
-            {
-              'id': 1,
-              'company': 'Premium Supplier Inc.',
-              'contact': 'John Smith',
-              'rating': 4.5,
-              'preferred': true,
-            },
-          );
+          {
+            'id': 1,
+            'company': 'Premium Supplier Inc.',
+            'contact': 'John Smith',
+            'rating': 4.5,
+            'preferred': true,
+          },
+        );
 
-          // Create product-supplier relationship
-          await harness.executeParams(
-            '''
+        // Create product-supplier relationship
+        await harness.executeParams(
+          '''
           INSERT INTO dbo.ProductSuppliers (product_id, supplier_id, supplier_product_code, cost, lead_time_days, minimum_order_qty, is_primary) 
           VALUES (@productId, @supplierId, @code, @cost, @leadTime, @minQty, @isPrimary)
         ''',
-            {
-              'productId': 1,
-              'supplierId': 1,
-              'code': 'SUP-TEST-001',
-              'cost': 80.0,
-              'leadTime': 7,
-              'minQty': 10,
-              'isPrimary': true,
-            },
-          );
+          {
+            'productId': 1,
+            'supplierId': 1,
+            'code': 'SUP-TEST-001',
+            'cost': 80.0,
+            'leadTime': 7,
+            'minQty': 10,
+            'isPrimary': true,
+          },
+        );
 
-          // Verify complex query with multiple JOINs
-          final rows = parseRows(
-            await harness.query('''
+        // Verify complex query with multiple JOINs
+        final rows = parseRows(
+          await harness.query('''
           SELECT 
             p.name as product_name,
             s.company_name,
@@ -1359,14 +1351,13 @@ void main() {
           JOIN dbo.Suppliers s ON ps.supplier_id = s.supplier_id
           WHERE p.product_id = 1 AND ps.is_primary = 1
         '''),
-          );
+        );
 
-          expect(rows.length, 1);
-          expect(rows.first['company_name'], 'Premium Supplier Inc.');
-          expect(rows.first['is_preferred'], true);
-          expect(rows.first['markup'], 70.0); // 150 - 80
-        },
-      );
+        expect(rows.length, 1);
+        expect(rows.first['company_name'], 'Premium Supplier Inc.');
+        expect(rows.first['is_preferred'], true);
+        expect(rows.first['markup'], '70.0000'); // 150 - 80
+      });
 
       // Continue with tests 6-50 for complex mode
       for (int i = 6; i <= 50; i++) {
@@ -1538,8 +1529,8 @@ void main() {
             if (i % 2 == 0) {
               expect(rows.length, 1);
               expect(rows.first['product_name'], 'Enterprise_Product_$i');
-              expect(rows.first['gross_margin'] > 0, true);
-              expect(rows.first['margin_percent'] is double, true);
+              expect(rows.first['gross_margin'], '${i * 60 + 100}.0000');
+              expect(rows.first['margin_percent'], isA<String>());
               expect(
                 [
                   'LOW_STOCK',

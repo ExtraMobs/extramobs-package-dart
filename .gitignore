@@ -8,3 +8,14 @@ pubspec.lock
 
 # FVM Version Cache
 .fvm/
+
+# Local credentials and native build intermediates
+.env
+.env.*
+!.env.example
+build/
+out-*/
+__pycache__/
+# Generated remnants of platform projects archived under todo/.
+/example/ios/
+/example/macos/

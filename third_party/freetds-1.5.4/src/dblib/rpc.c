@@ -167,6 +167,8 @@ dbrpcparam(DBPROCESS * dbproc, const char paramname[], BYTE status, int db_type,
 
 	DBPERROR_RETURN(!is_tds_type_valid(db_type), SYBEUDTY);
 	type = (TDS_SERVER_TYPE) db_type;
+	DBPERROR_RETURN((status & DBRPCEMPTY) &&
+		(datalen != 0 || value == NULL || is_fixed_type(type)), SYBERPIL);
 
 	/* validate datalen parameter */
 
@@ -242,7 +244,7 @@ dbrpcparam(DBPROCESS * dbproc, const char paramname[], BYTE status, int db_type,
 	 * If datalen = 0, value parameter is ignored.
 	 * This is one way to specify a NULL input parameter. 
 	 */
-	if (datalen == 0)
+	if (datalen == 0 && !(status & DBRPCEMPTY))
 		param->value = NULL;
 	else
 		param->value = value;
@@ -396,7 +398,7 @@ param_info_alloc(TDSSOCKET * tds, DBREMOTE_PROC * rpc)
 		temp_value = p->value;
 		temp_datalen = p->datalen;
 
-		if (p->datalen == 0)
+		if (p->datalen == 0 && !(p->status & DBRPCEMPTY))
 			param_is_null = 1; 
 
 		tdsdump_log(TDS_DBG_INFO1, "parm_info_alloc(): parameter null-ness = %d\n", param_is_null);
@@ -445,10 +447,12 @@ param_info_alloc(TDSSOCKET * tds, DBREMOTE_PROC * rpc)
 			pcol->column_size *= 2;
 		pcol->on_server.column_size = pcol->column_size;
 
-		pcol->column_output = p->status;
+		pcol->column_output = p->status & DBRPCRETURN;
 		pcol->column_cur_size = temp_datalen;
 
 		prow = param_row_alloc(params, pcol, i, temp_value, temp_datalen);
+		if (prow && (p->status & DBRPCEMPTY))
+			pcol->column_cur_size = 0;
 
 		if (!prow) {
 			tds_free_param_results(params);

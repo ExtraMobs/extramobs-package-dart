@@ -10,6 +10,9 @@ set -euo pipefail
 
 SRC_DIR="$1"
 OUT_DIR="$2"
+: "${OPENSSL_ROOT_DIR:?Set the static OpenSSL prefix}"
+test -f "$OPENSSL_ROOT_DIR/lib/libssl.a"
+test -f "$OPENSSL_ROOT_DIR/lib/libcrypto.a"
 
 mkdir -p "$OUT_DIR"
 pushd "$SRC_DIR" >/dev/null
@@ -44,14 +47,19 @@ rm -rf build-autotools && mkdir build-autotools && cd build-autotools
   --enable-shared \
   --disable-static \
   --disable-libiconv \
+  --with-openssl="$OPENSSL_ROOT_DIR" \
   --enable-msdblib
 
 make -j"$(sysctl -n hw.ncpu 2>/dev/null || nproc)"
 make install
+grep -q '^#define HAVE_OPENSSL 1' include/config.h
 
 # Copy main runtime libs to OUT_DIR/lib for convenience
 mkdir -p "$OUT_DIR/lib"
 cp -a "$OUT_DIR/prefix/lib/"* "$OUT_DIR/lib/"
+if [[ "$(uname)" == Darwin ]]; then
+  install_name_tool -id '@rpath/libsybdb.dylib' "$OUT_DIR/lib/libsybdb.dylib"
+fi
 
 popd >/dev/null
 echo "Built POSIX libs into: $OUT_DIR"

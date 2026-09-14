@@ -547,6 +547,7 @@ typedef struct tds_login
 	unsigned int use_new_password:1;
 	unsigned int valid_configuration:1;
 	unsigned int check_ssl_hostname:1;
+	unsigned int cafile_specified:1; /* explicit DB-Lib setting, including empty */
 	unsigned int readonly_intent:1;
 	unsigned int enable_tls_v1:1;
 	unsigned int enable_tls_v1_specified:1;
@@ -1144,6 +1145,8 @@ struct tds_connection
 	uint8_t unicharsize;
 
 	void *tls_session;
+	unsigned char *peer_certificate_der; /* survives login-only TLS shutdown */
+	int peer_certificate_der_len;
 #if defined(HAVE_GNUTLS)
 	void *tls_credentials;
 #elif defined(HAVE_OPENSSL)
