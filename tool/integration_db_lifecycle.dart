@@ -1,95 +1,75 @@
+import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:mssql_connection/mssql_connection.dart';
+import 'package:mssql/mssql_connection.dart';
 
-Future<int> main() async {
-  // Provided credentials
-  const server = '192.168.1.10:1433';
-  const username = 'sa';
-  const password = 'eSeal@123';
-
-  // Parse server into ip/port
-  final parts = server.split(':');
-  final ip = parts.isNotEmpty ? parts.first : '127.0.0.1';
-  final port = parts.length > 1 ? parts[1] : '1433';
-
-  final conn = MssqlConnection.getInstance();
-  print('Connecting to master...');
-  final ok = await conn.connect(
-    ip: ip,
-    port: port,
-    databaseName: 'master',
-    username: username,
-    password: password,
-  );
-  if (!ok) {
-    print('CONNECT FAILED');
-    return 1;
-  }
-
-  final dbName = 'Test_${DateTime.now().millisecondsSinceEpoch}';
-  print('Using database: $dbName');
-
+// Destructive integration tool: creates and removes its own temporary database.
+Future<void> main() async {
+  final env = Platform.environment;
+  String required(String key) =>
+      env[key] ??
+      (throw StateError('Explicit $key test configuration required'));
+  final db = MssqlConnectionAsync();
+  final dbName = 'Test_${DateTime.now().microsecondsSinceEpoch}';
+  var created = false;
   try {
-    // Create DB
-    print('Creating DB...');
-    print(await conn.writeData('CREATE DATABASE [$dbName]'));
-
-    // Switch context
-    print('Using DB...');
-    print(await conn.writeData('USE [$dbName]'));
-
-    // Create table
-    print('Creating table...');
-    print(
-      await conn.writeData('''
-      CREATE TABLE dbo.Items (
-        id INT NOT NULL PRIMARY KEY,
-        name NVARCHAR(100) NOT NULL,
-        created DATETIME NULL,
-        flag BIT NULL,
-        data VARBINARY(MAX) NULL
-      )
-    '''),
+    final connected = await db.connect(
+      ip: required('MSSQL_IP'),
+      port: env['MSSQL_PORT'] ?? '1433',
+      databaseName: 'master',
+      username: required('MSSQL_USER'),
+      password: required('MSSQL_PASSWORD'),
+      tls: TlsRequire(
+        trust: env['MSSQL_TRUST_SERVER_CERTIFICATE'] == 'true'
+            ? null
+            : env['MSSQL_CA_FILE'] == null || env['MSSQL_CA_FILE'] == 'system'
+            ? const TlsSystemTrust()
+            : TlsPemTrust(env['MSSQL_CA_FILE']!),
+        certificateHostname: env['MSSQL_CERTIFICATE_HOSTNAME'],
+      ),
+      autocommit: true, // CREATE/DROP DATABASE cannot run in a transaction.
     );
-
-    // Insert via sp_executesql with explicit types
-    print('Inserting row via params...');
-    final insertRes = await conn.writeDataWithParams(
-      'INSERT INTO dbo.Items (id, name, created, flag, data) VALUES (@id, @name, @created, @flag, @data)',
-      {
-        'id': 1,
-        'name': 'hello',
-        'created': DateTime.now(),
-        'flag': true,
-        'data': Uint8List.fromList([1, 2, 3, 4]),
-      },
-    );
-    print(insertRes);
-    // print('Waiting for 5 minutes(Manual Inspection)...');
-    // await Future.delayed(const Duration(minutes: 5));
-    // Query back
-    print('Selecting rows...');
-    final rowsJson = await conn.getData(
-      'SELECT id, name, created, flag, DATALENGTH(data) AS data_len FROM dbo.Items',
-    );
-    print(rowsJson);
-  } catch (e) {
-    print('ERROR: $e');
-  } finally {
-    // Always drop DB; force single_user to avoid locks
-    print('Dropping DB...');
+    if (!connected) throw StateError('Connection failed');
+    final cursor = db.cursor();
     try {
-      await conn.writeData('USE master');
-      await conn.writeData(
-        'ALTER DATABASE [$dbName] SET SINGLE_USER WITH ROLLBACK IMMEDIATE',
-      );
-      print(await conn.writeData('DROP DATABASE [$dbName]'));
-    } catch (e) {
-      print('Drop DB error: $e');
+      await cursor.execute('CREATE DATABASE [$dbName]');
+      created = true;
+      await cursor.execute('USE [$dbName]');
+      await cursor.execute('''
+        CREATE TABLE dbo.Items (
+          id int PRIMARY KEY, name nvarchar(100), created datetimeoffset(7),
+          flag bit, data varbinary(max)
+        )
+      ''');
+      await cursor.execute('INSERT INTO dbo.Items VALUES (?, ?, ?, ?, ?)', [
+        1,
+        'hello',
+        DateTime.now(),
+        true,
+        Uint8List.fromList([1, 2, 3, 4]),
+      ]);
+      await cursor.execute('SELECT * FROM dbo.Items');
+      await for (final row in cursor) {
+        stdout.writeln(row.values);
+      }
+    } finally {
+      await cursor.close();
+      if (created && db.isConnected) {
+        final cleanup = db.cursor();
+        try {
+          await cleanup.execute('USE master');
+          await cleanup.execute(
+            'ALTER DATABASE [$dbName] SET SINGLE_USER WITH ROLLBACK IMMEDIATE',
+          );
+          await cleanup.execute('DROP DATABASE [$dbName]');
+          created = false;
+        } finally {
+          await cleanup.close();
+        }
+      }
     }
-    await conn.disconnect();
+  } finally {
+    await db.close();
+    if (created) stderr.writeln('Cleanup required for database [$dbName]');
   }
-
-  return 0;
 }

@@ -1,0 +1,165 @@
+name: FreeTDS and Flutter validation
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    paths: ['lib/**', 'test/**', 'scripts/**', 'third_party/**', 'windows/**', 'android/**', 'ios/**', 'macos/**', 'linux/**', 'pubspec.yaml', '.github/workflows/freetds-multi.yml']
+permissions:
+  contents: read
+jobs:
+  dart:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: flutter analyze
+      - run: dart test test/freetds_text_test.dart
+  posix:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: linux-x86_64
+            platform: linux
+          - os: macos-14
+            target: darwin64-arm64-cc
+            platform: macos
+          - os: macos-15-intel
+            target: darwin64-x86_64-cc
+            platform: macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y autoconf automake libtool gettext pkg-config clang cmake ninja-build libgtk-3-dev
+      - if: runner.os == 'macOS'
+        run: brew install autoconf automake libtool gettext pkg-config
+      - run: bash scripts/build-openssl.sh '${{ matrix.target }}' "$GITHUB_WORKSPACE/build/openssl"
+      - run: OPENSSL_ROOT_DIR="$GITHUB_WORKSPACE/build/openssl/prefix" bash scripts/build-posix.sh "$GITHUB_WORKSPACE/third_party/freetds-1.5.4" "$GITHUB_WORKSPACE/build/freetds"
+      - name: Stage rebuilt runtime
+        shell: bash
+        run: |
+          mkdir -p '${{ matrix.platform }}/Libraries/lib'
+          cp -L build/freetds/lib/libsybdb.* '${{ matrix.platform }}/Libraries/lib/'
+      - run: flutter pub get
+      - run: dart test test/native_library_test.dart
+      - working-directory: example
+        run: flutter build ${{ matrix.platform }} --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.target }}
+          path: ${{ matrix.platform }}/Libraries/lib/libsybdb.*
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.40'
+          distribution: strawberry
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - shell: pwsh
+        run: |
+          ./scripts/build-openssl.ps1 -Out "$env:GITHUB_WORKSPACE/build/openssl"
+          ./scripts/build-windows.ps1 -Src "$env:GITHUB_WORKSPACE/third_party/freetds-1.5.4" -Out "$env:GITHUB_WORKSPACE/build/freetds" -OpenSSLRoot "$env:GITHUB_WORKSPACE/build/openssl/prefix"
+          Copy-Item build/freetds/bin/sybdb.dll windows/Libraries/bin/sybdb.dll
+      - run: flutter pub get
+      - run: dart test test/native_library_test.dart
+      - working-directory: example
+        run: flutter build windows --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-windows-x64
+          path: windows/Libraries/bin/sybdb.dll
+  android:
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        include:
+          - abi: arm64-v8a
+            ssl: android-arm64
+          - abi: armeabi-v7a
+            ssl: android-arm
+          - abi: x86_64
+            ssl: android-x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - run: |
+          sdkmanager --install 'ndk;28.2.13676358' 'cmake;3.22.1' 'platforms;android-35'
+          echo "ANDROID_NDK=$ANDROID_SDK_ROOT/ndk/28.2.13676358" >> "$GITHUB_ENV"
+      - run: bash scripts/build-openssl.sh '${{ matrix.ssl }}' "$GITHUB_WORKSPACE/build/openssl" -D__ANDROID_API__=21
+      - run: OPENSSL_ROOT_DIR="$GITHUB_WORKSPACE/build/openssl/prefix" bash scripts/build-android.sh "$GITHUB_WORKSPACE/third_party/freetds-1.5.4" "$GITHUB_WORKSPACE/build/freetds" '${{ matrix.abi }}'
+      - run: python3 scripts/check-android-libraries.py build/freetds/${{ matrix.abi }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-android-${{ matrix.abi }}
+          path: build/freetds/${{ matrix.abi }}/*.so
+  android-package:
+    needs: android
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager --install 'build-tools;35.0.0'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-android-*
+          path: build/android-artifacts
+      - name: Stage and verify every rebuilt ABI
+        run: |
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            cp build/android-artifacts/native-android-$abi/*.so android/src/main/jniLibs/$abi/
+          done
+          python3 scripts/check-android-libraries.py android/src/main/jniLibs
+      - working-directory: example
+        run: |
+          flutter build apk --release
+          flutter build appbundle --release
+      - name: Verify APK native library alignment
+        run: "$ANDROID_SDK_ROOT/build-tools/35.0.0/zipalign -c -P 16 -v 4 example/build/app/outputs/flutter-apk/app-release.apk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-release-packages
+          path: |
+            example/build/app/outputs/flutter-apk/app-release.apk
+            example/build/app/outputs/bundle/release/app-release.aab
+  ios:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - run: brew install autoconf automake libtool gettext pkg-config
+      - run: bash scripts/build-ios.sh "$GITHUB_WORKSPACE/third_party/freetds-1.5.4" "$GITHUB_WORKSPACE/build/freetds"
+      - run: ditto build/freetds/FreeTDS-DB.xcframework ios/FreeTDS/FreeTDS-DB.xcframework
+      - working-directory: example
+        run: flutter build ios --release --no-codesign
+      - working-directory: example
+        run: flutter build ios --simulator --debug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-ios
+          path: ios/FreeTDS/FreeTDS-DB.xcframework

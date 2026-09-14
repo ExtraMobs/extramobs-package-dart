@@ -15,41 +15,22 @@ import 'dart:convert';
 import 'dart:ffi';
 import 'dart:typed_data';
 
+import '../native_logger.dart';
+
 import 'package:ffi/ffi.dart';
 
 import '../native_loader.dart';
+import 'freetds_text.dart';
 
 // Opaque types
 base class DBPROCESS extends Opaque {}
-
-// Minimal UTF-16LE decoder (assumes even-length input of UCS-2/UTF-16LE code units)
-String _utf16leDecode(Uint8List bytes) {
-  final n = bytes.length & ~1; // even length
-  final codes = List<int>.filled(n >> 1, 0);
-  for (int i = 0, j = 0; i < n; i += 2, j++) {
-    codes[j] = bytes[i] | (bytes[i + 1] << 8);
-  }
-  return String.fromCharCodes(codes);
-}
-
-// Heuristic: detect if a byte array likely contains UTF-16LE encoded text mistakenly
-// tagged as VARCHAR (i.e., ASCII bytes with 0x00 interleaved). We check for even length
-// and a high ratio of zero bytes in odd positions.
-bool _looksUtf16LeText(Uint8List bytes) {
-  if (bytes.length < 2 || (bytes.length & 1) == 1) return false;
-  // If any odd index contains 0x00, it's likely UTF-16LE (for ASCII-range chars)
-  // Allow odd-length inputs; the last trailing byte will be ignored by the decoder.
-  for (int i = 1; i < bytes.length; i += 2) {
-    if (bytes[i] == 0) return true;
-  }
-  return false;
-}
 
 base class LOGINREC extends Opaque {}
 
 // Common return codes
 const int SUCCEED = 1;
 const int FAIL = 0;
+const int INT_CANCEL = 2;
 const int NO_MORE_RESULTS = 2; // dbresults may return NO_MORE_RESULTS
 
 // Row fetch status (dbnextrow) as per FreeTDS sybdb.h
@@ -104,6 +85,13 @@ const int DBTEXTSIZE = 17; // set text size for large text retrieval
 // Per sybdb.h, DBSETUSER and DBSETPWD constants used with dbsetlname()
 const int DBSETUSER = 2;
 const int DBSETPWD = 3;
+const int DBSETCHARSET = 10;
+const int DBSETENCRYPTION = 1005;
+// Private extensions in the bundled FreeTDS build; older libraries fail closed.
+const int DBSETCAFILE = 20001;
+const int DBSETCERTIFICATEHOSTNAME = 20002;
+const int DBSETTIME = 34;
+const int DBRPCEMPTY = 0x80;
 
 // RPC options (per sybdb.h)
 // DBRPCRECOMPILE causes the stored procedure to be recompiled before executing.
@@ -116,13 +104,15 @@ const int DBRPCRESET = 0x0002;
 // Group: Connection lifecycle (init/login/open/close)
 // These map to DB-Lib primitives to initialize the library, create a LOGINREC,
 // set credentials, open a DBPROCESS (connection), and cleanly close/exit.
-/// C: void dbinit(void) — Initialize DB-Lib (call once in process before using DB-Lib)
-typedef _dbinitC = Void Function();
-typedef _dbinitDart = void Function();
+/// C: RETCODE dbinit(void) — Initialize DB-Lib.
+typedef _dbinitC = Int32 Function();
+typedef _dbinitDart = int Function();
 
 /// C: LOGINREC* dblogin(void) — Allocate a login record handle
 typedef _dbloginC = Pointer<LOGINREC> Function();
 typedef _dbloginDart = Pointer<LOGINREC> Function();
+typedef _dbloginfreeC = Void Function(Pointer<LOGINREC>);
+typedef _dbloginfreeDart = void Function(Pointer<LOGINREC>);
 
 // Note: DBSETLUSER/DBSETLPWD are macros in sybdb.h that call dbsetlname()
 // with selectors DBSETUSER/DBSETPWD. We bind dbsetlname and add thin wrappers
@@ -139,9 +129,14 @@ typedef _dbopenC =
 typedef _dbopenDart =
     Pointer<DBPROCESS> Function(Pointer<LOGINREC>, Pointer<Utf8>);
 
-/// C: int dbclose(DBPROCESS*) — Close connection (DBPROCESS)
-typedef _dbcloseC = Int32 Function(Pointer<DBPROCESS>);
-typedef _dbcloseDart = int Function(Pointer<DBPROCESS>);
+typedef _tdsdbopenC =
+    Pointer<DBPROCESS> Function(Pointer<LOGINREC>, Pointer<Utf8>, Int32);
+typedef _tdsdbopenDart =
+    Pointer<DBPROCESS> Function(Pointer<LOGINREC>, Pointer<Utf8>, int);
+
+/// C: void dbclose(DBPROCESS*)
+typedef _dbcloseC = Void Function(Pointer<DBPROCESS>);
+typedef _dbcloseDart = void Function(Pointer<DBPROCESS>);
 
 /// C: void dbexit(void) — Shutdown DB-Lib (call when done with all DB work)
 typedef _dbexitC = Void Function();
@@ -163,6 +158,12 @@ typedef _dbresultsDart = int Function(Pointer<DBPROCESS>);
 /// C: int dbnextrow(DBPROCESS*) — Fetch next row (REG_ROW/-1 for row, NO_MORE_ROWS/-2 end)
 typedef _dbnextrowC = Int32 Function(Pointer<DBPROCESS>);
 typedef _dbnextrowDart = int Function(Pointer<DBPROCESS>);
+
+/// Cancel all results, or discard only the remaining rows of the current result.
+typedef _dbcancelC = Int32 Function(Pointer<DBPROCESS>);
+typedef _dbcancelDart = int Function(Pointer<DBPROCESS>);
+typedef _dbdeadC = Uint8 Function(Pointer<DBPROCESS>);
+typedef _dbdeadDart = int Function(Pointer<DBPROCESS>);
 
 /// C: int dbnumcols(DBPROCESS*) — Column count for current result set
 typedef _dbnumcolsC = Int32 Function(Pointer<DBPROCESS>);
@@ -202,7 +203,7 @@ typedef _dbuseC = Int32 Function(Pointer<DBPROCESS>, Pointer<Utf8>);
 typedef _dbuseDart = int Function(Pointer<DBPROCESS>, Pointer<Utf8>);
 
 // Group: LOGINREC options (e.g., enable BCP using DBSETBCP)
-/// C: int dbsetlbool(LOGINREC*, int option, int value) — Toggle login options
+/// C: int dbsetlbool(LOGINREC*, int value, int which) — Toggle login options
 typedef _dbsetlboolC = Int32 Function(Pointer<LOGINREC>, Int32, Int32);
 typedef _dbsetlboolDart = int Function(Pointer<LOGINREC>, int, int);
 
@@ -286,6 +287,17 @@ typedef _dbmsghandleC =
     );
 typedef _dbmsghandleDart =
     Pointer<NativeFunction<_msgHandlerSigC>> Function(
+      Pointer<NativeFunction<_msgHandlerSigC>>,
+    );
+
+typedef _wrapperInitC =
+    Int32 Function(
+      Pointer<NativeFunction<_errHandlerSigC>>,
+      Pointer<NativeFunction<_msgHandlerSigC>>,
+    );
+typedef _wrapperInitDart =
+    int Function(
+      Pointer<NativeFunction<_errHandlerSigC>>,
       Pointer<NativeFunction<_msgHandlerSigC>>,
     );
 
@@ -416,7 +428,11 @@ class DBLib {
   */
   final DynamicLibrary _lib;
   late final _dbinitDart dbinit;
+  late final _wrapperInitDart initialize;
+  late final int Function(Pointer<DBPROCESS>, Pointer<Uint8>, int)
+  peerCertificate;
   late final _dbloginDart dblogin;
+  late final _dbloginfreeDart dbloginfree;
   late final _dbsetlnameDart dbsetlname;
   late final _dbopenDart dbopen;
   late final _dbcloseDart dbclose;
@@ -426,6 +442,9 @@ class DBLib {
   late final _dbsqlexecDart dbsqlexec;
   late final _dbresultsDart dbresults;
   late final _dbnextrowDart dbnextrow;
+  late final _dbcancelDart dbcancel;
+  late final _dbcancelDart dbcanquery;
+  late final _dbdeadDart dbdead;
   late final _dbnumcolsDart dbnumcols;
   late final _dbcolnameDart dbcolname;
   late final _dbcoltypeDart dbcoltype;
@@ -456,6 +475,15 @@ class DBLib {
   late final _dbconvertDart dbconvert;
 
   DBLib(this._lib) {
+    // Required symbol also rejects binaries predating the TLS configuration API.
+    peerCertificate = _lib
+        .lookupFunction<
+          Int32 Function(Pointer<DBPROCESS>, Pointer<Uint8>, Int32),
+          int Function(Pointer<DBPROCESS>, Pointer<Uint8>, int)
+        >('sql_server_wrapper_peer_certificate');
+    initialize = _lib.lookupFunction<_wrapperInitC, _wrapperInitDart>(
+      'sql_server_wrapper_init',
+    );
     // Lookups: Connection lifecycle (init/login/open/close)
     dbinit = _lib.lookupFunction<_dbinitC, _dbinitDart>(
       'dbinit',
@@ -463,13 +491,21 @@ class DBLib {
     dblogin = _lib.lookupFunction<_dbloginC, _dbloginDart>(
       'dblogin',
     ); // Create LOGINREC
+    dbloginfree = _lib.lookupFunction<_dbloginfreeC, _dbloginfreeDart>(
+      'dbloginfree',
+    );
     // DBSETLUSER/DBSETLPWD are macros -> bind the underlying function dbsetlname
     dbsetlname = _lib.lookupFunction<_dbsetlnameC, _dbsetlnameDart>(
       'dbsetlname',
     ); // Set LOGINREC field by selector
-    dbopen = _lib.lookupFunction<_dbopenC, _dbopenDart>(
-      'dbopen',
-    ); // Open DBPROCESS connection
+    try {
+      dbopen = _lib.lookupFunction<_dbopenC, _dbopenDart>('dbopen');
+    } catch (_) {
+      final open = _lib.lookupFunction<_tdsdbopenC, _tdsdbopenDart>(
+        'tdsdbopen',
+      );
+      dbopen = (login, server) => open(login, server, 1);
+    }
     dbclose = _lib.lookupFunction<_dbcloseC, _dbcloseDart>(
       'dbclose',
     ); // Close DBPROCESS
@@ -488,6 +524,9 @@ class DBLib {
     dbnextrow = _lib.lookupFunction<_dbnextrowC, _dbnextrowDart>(
       'dbnextrow',
     ); // Fetch next row
+    dbcancel = _lib.lookupFunction<_dbcancelC, _dbcancelDart>('dbcancel');
+    dbcanquery = _lib.lookupFunction<_dbcancelC, _dbcancelDart>('dbcanquery');
+    dbdead = _lib.lookupFunction<_dbdeadC, _dbdeadDart>('dbdead');
     dbnumcols = _lib.lookupFunction<_dbnumcolsC, _dbnumcolsDart>(
       'dbnumcols',
     ); // Column count
@@ -603,7 +642,24 @@ class DBLib {
   int dbsetlpwd(Pointer<LOGINREC> login, Pointer<Utf8> password) =>
       dbsetlname(login, password, DBSETPWD);
 
+  /// Set the charset on a LOGINREC using the DBSETCHARSET selector.
+  int dbsetlcharset(Pointer<LOGINREC> login, Pointer<Utf8> charset) =>
+      dbsetlname(login, charset, DBSETCHARSET);
+
   static DBLib load() => DBLib(NativeLoader.loadDBLib());
+
+  // Capture synchronously: a failed dbopen may report a temporary DBPROCESS
+  // in its callbacks but return nullptr, making per-pointer lookup impossible.
+  static (T, List<String>) captureDiagnostics<T>(T Function() action) {
+    final previous = _DbLibErrorStore.capture;
+    final messages = <String>[];
+    _DbLibErrorStore.capture = messages;
+    try {
+      return (action(), messages);
+    } finally {
+      _DbLibErrorStore.capture = previous;
+    }
+  }
 
   // Expose latest DB-Lib error/message captured by installed handlers.
   // These are per-DBPROCESS (or 0 for library-level) and are cleared on read.
@@ -615,6 +671,7 @@ class DBLib {
 
 // Simple global store for the latest error/message per DBPROCESS.
 class _DbLibErrorStore {
+  static List<String>? capture;
   static final Map<int, String> _lastError = <int, String>{};
   static final Map<int, String> _lastMessage = <int, String>{};
   static String? takeLastError(Pointer<DBPROCESS>? dbproc) {
@@ -623,6 +680,10 @@ class _DbLibErrorStore {
   }
 
   static void setLastError(Pointer<DBPROCESS>? dbproc, String msg) {
+    if (capture != null) {
+      capture!.add(msg);
+      return;
+    }
     final k = dbproc == null || dbproc == nullptr ? 0 : dbproc.address;
     _lastError[k] = msg;
   }
@@ -633,12 +694,35 @@ class _DbLibErrorStore {
   }
 
   static void setLastMessage(Pointer<DBPROCESS>? dbproc, String msg) {
+    if (capture != null) {
+      capture!.add(msg);
+      return;
+    }
     final k = dbproc == null || dbproc == nullptr ? 0 : dbproc.address;
     _lastMessage[k] = msg;
   }
 }
 
 // Dart-side error handlers (installed via dberrhandle/dbmsghandle).
+// Diagnostics must not throw through a native callback. Malformed sequences
+// become U+FFFD here only; result data is decoded strictly with the same codec.
+String _decodeDiagnostic(Pointer<Utf8> text) {
+  if (text == nullptr) return '';
+  try {
+    final bytes = text.cast<Uint8>();
+    var length = 0;
+    while (length < 4096 && bytes[length] != 0) {
+      length++;
+    }
+    return freeTdsTextCodec.decode(
+      bytes.asTypedList(length),
+      allowMalformed: true,
+    );
+  } catch (_) {
+    return '';
+  }
+}
+
 int _dartDbErrHandler(
   Pointer<DBPROCESS> dbproc,
   int severity,
@@ -647,33 +731,17 @@ int _dartDbErrHandler(
   Pointer<Utf8> dberrstr,
   Pointer<Utf8> oserrstr,
 ) {
-  // Be extremely defensive: message buffers may not be valid UTF-8.
-  String safeFromUtf8(Pointer<Utf8> p) {
-    if (p == nullptr) return '';
-    try {
-      return p.toDartString();
-    } catch (_) {
-      // Fallback: read up to 4KB, stop at NUL, and decode as latin1 to avoid throws.
-      try {
-        final bytes = <int>[];
-        for (int i = 0; i < 4096; i++) {
-          final b = p.cast<Uint8>().elementAt(i).value;
-          if (b == 0) break;
-          bytes.add(b);
-        }
-        return const Latin1Codec(allowInvalid: true).decode(bytes);
-      } catch (_) {
-        return '';
-      }
-    }
-  }
-
   final msg =
       '[severity=$severity dberr=$dberr oserr=$oserr] '
-      '${safeFromUtf8(dberrstr)}'
-      '${oserrstr == nullptr ? '' : ' | ${safeFromUtf8(oserrstr)}'}';
+      '${_decodeDiagnostic(dberrstr)}'
+      '${oserrstr == nullptr ? '' : ' | ${_decodeDiagnostic(oserrstr)}'}';
   _DbLibErrorStore.setLastError(dbproc, msg);
-  return 0; // per DB-Lib docs, return value ignored
+  try {
+    MssqlLogger.e('DB-Lib callback | $msg');
+  } catch (_) {
+    // Logging must not throw through a native callback.
+  }
+  return INT_CANCEL;
 }
 
 int _dartDbMsgHandler(
@@ -686,35 +754,21 @@ int _dartDbMsgHandler(
   Pointer<Utf8> proc,
   int line,
 ) {
-  String safeFromUtf8(Pointer<Utf8> p) {
-    if (p == nullptr) return '';
-    try {
-      return p.toDartString();
-    } catch (_) {
-      try {
-        final bytes = <int>[];
-        for (int i = 0; i < 4096; i++) {
-          final b = p.cast<Uint8>().elementAt(i).value;
-          if (b == 0) break;
-          bytes.add(b);
-        }
-        return const Latin1Codec(allowInvalid: true).decode(bytes);
-      } catch (_) {
-        return '';
-      }
-    }
-  }
-
   final msg =
       '[msgno=$msgno state=$msgstate severity=$severity line=$line] '
-      '${safeFromUtf8(msgtext)}';
+      '${_decodeDiagnostic(msgtext)}';
   _DbLibErrorStore.setLastMessage(dbproc, msg);
+  try {
+    MssqlLogger.i('SQL Server callback | $msg');
+  } catch (_) {
+    // Logging must not throw through a native callback.
+  }
   return 0;
 }
 
 // Exposed pointers for installation; keep them alive for the process lifetime.
 final Pointer<NativeFunction<_errHandlerSigC>> kErrHandlerPtr =
-    Pointer.fromFunction<_errHandlerSigC>(_dartDbErrHandler, 0);
+    Pointer.fromFunction<_errHandlerSigC>(_dartDbErrHandler, INT_CANCEL);
 final Pointer<NativeFunction<_msgHandlerSigC>> kMsgHandlerPtr =
     Pointer.fromFunction<_msgHandlerSigC>(_dartDbMsgHandler, 0);
 
@@ -734,13 +788,23 @@ ByteData _asByteData(Pointer<Uint8> ptr, int len) {
 ///
 /// - This performs pragmatic, alignment-safe decoding for common scalar types
 ///   (integers, floats, money, datetime), basic text (char/varchar/ntext/nvarchar),
-///   and binary (base64-string).
+///   and binary (copied, unmodifiable Uint8List).
 /// - For complex types (DECIMAL/NUMERIC and newer SQL Server date/time types),
 ///   prefer [decodeDbValueWithFallback] which can call `dbconvert` to produce
-///   strings or doubles.
-/// - Returns null if [ptr] is null or [len] <= 0.
+///   exact decimal strings.
+/// - Returns null if [ptr] is null; empty text/binary values remain distinct.
 dynamic decodeDbValue(int type, Pointer<Uint8> ptr, int len) {
-  if (ptr == nullptr || len <= 0) return null;
+  if (ptr == nullptr) return null;
+  if (len < 0) throw FormatException('Negative DB-Lib value length');
+  if (type == SYBBINARY || type == SYBVARBINARY || type == SYBIMAGE) {
+    return Uint8List.fromList(ptr.asTypedList(len)).asUnmodifiableView();
+  }
+  if (len == 0) {
+    if ([SYBCHAR, SYBVARCHAR, SYBTEXT, SYBNTEXT, SYBNVARCHAR].contains(type)) {
+      return '';
+    }
+    throw FormatException('Empty fixed-size DB-Lib value (type=$type)');
+  }
   final bd =
       (type == SYBINT1 ||
           type == SYBCHAR ||
@@ -760,30 +824,30 @@ dynamic decodeDbValue(int type, Pointer<Uint8> ptr, int len) {
         case 1:
           return ptr.cast<Uint8>().value;
         case 2:
-          return _asByteData(ptr, 2).getInt16(0, Endian.little);
+          return _asByteData(ptr, 2).getInt16(0, Endian.host);
         case 4:
-          return _asByteData(ptr, 4).getInt32(0, Endian.little);
+          return _asByteData(ptr, 4).getInt32(0, Endian.host);
         case 8:
-          return _asByteData(ptr, 8).getInt64(0, Endian.little);
+          return _asByteData(ptr, 8).getInt64(0, Endian.host);
         default:
           return ptr.asTypedList(len);
       }
     case SYBINT1:
       return ptr.cast<Uint8>().value;
     case SYBINT2:
-      return bd!.getInt16(0, Endian.little);
+      return bd!.getInt16(0, Endian.host);
     case SYBINT4:
-      return bd!.getInt32(0, Endian.little);
+      return bd!.getInt32(0, Endian.host);
     case SYBINT8:
-      return bd!.getInt64(0, Endian.little);
+      return bd!.getInt64(0, Endian.host);
     case SYBREAL:
-      return bd!.getFloat32(0, Endian.little);
+      return bd!.getFloat32(0, Endian.host);
     case SYBFLT8:
-      return bd!.getFloat64(0, Endian.little);
+      return bd!.getFloat64(0, Endian.host);
     case SYBFLTN:
       // infer by length
-      if (len == 4) return _asByteData(ptr, 4).getFloat32(0, Endian.little);
-      if (len == 8) return _asByteData(ptr, 8).getFloat64(0, Endian.little);
+      if (len == 4) return _asByteData(ptr, 4).getFloat32(0, Endian.host);
+      if (len == 8) return _asByteData(ptr, 8).getFloat64(0, Endian.host);
       return ptr.asTypedList(len);
     case SYBBIT:
       return ptr.cast<Uint8>().value != 0;
@@ -791,57 +855,68 @@ dynamic decodeDbValue(int type, Pointer<Uint8> ptr, int len) {
       return len == 0 ? null : (ptr.cast<Uint8>().value != 0);
     case SYBMONEY:
       {
-        // 8-byte money: signed 64-bit scaled by 10000 (SQL Server MONEY)
-        final i64 = _asByteData(ptr, 8).getInt64(0, Endian.little);
-        return i64 / 10000.0;
+        // DBMONEY stores its high word first, independently of host endianness.
+        final value =
+            (BigInt.from(bd!.getInt32(0, Endian.host)) << 32) +
+            BigInt.from(bd.getUint32(4, Endian.host));
+        return _scaledMoney(value);
       }
     case SYBMONEY4:
       {
-        final v = bd!.getInt32(0, Endian.little); // scaled by 10000
-        return v / 10000.0;
+        return _scaledMoney(BigInt.from(bd!.getInt32(0, Endian.host)));
       }
     case SYBDATETIME:
       {
         // DBDATETIME: days since 1900-01-01, time in 1/300 sec units
-        final days = bd!.getInt32(0, Endian.little);
-        final time300 = bd.getInt32(4, Endian.little);
-        final base = DateTime(1900, 1, 1);
+        final days = bd!.getInt32(0, Endian.host);
+        final time300 = bd.getInt32(4, Endian.host);
+        final base = DateTime.utc(1900, 1, 1);
         final date = base.add(Duration(days: days));
         final micros = (time300 * 1000000) ~/ 300;
         final dt = date.add(Duration(microseconds: micros));
-        return dt.toIso8601String();
+        return dt.toIso8601String().replaceFirst('Z', '');
       }
     case SYBDATETIME4:
       {
         // DBDATETIME4: USMALLINT days since 1900-01-01, USMALLINT minutes since midnight
-        final days = bd!.getUint16(0, Endian.little);
-        final minutes = bd.getUint16(2, Endian.little);
-        final base = DateTime(1900, 1, 1);
+        final days = bd!.getUint16(0, Endian.host);
+        final minutes = bd.getUint16(2, Endian.host);
+        final base = DateTime.utc(1900, 1, 1);
         final dt = base.add(Duration(days: days, minutes: minutes));
-        return dt.toIso8601String();
+        return dt.toIso8601String().replaceFirst('Z', '');
       }
-    case SYBBINARY:
-    case SYBVARBINARY:
-    case SYBIMAGE:
+    case SYBDATETIMN:
       {
-        final bytes = ptr.asTypedList(len);
-        return base64.encode(bytes);
+        if (len == 8) {
+          final days = bd!.getInt32(0, Endian.host);
+          final time300 = bd.getInt32(4, Endian.host);
+          final base = DateTime.utc(1900, 1, 1);
+          final date = base.add(Duration(days: days));
+          final micros = (time300 * 1000000) ~/ 300;
+          final dt = date.add(Duration(microseconds: micros));
+          return dt.toIso8601String().replaceFirst('Z', '');
+        } else if (len == 4) {
+          final days = bd!.getUint16(0, Endian.host);
+          final minutes = bd.getUint16(2, Endian.host);
+          final base = DateTime.utc(1900, 1, 1);
+          final dt = base.add(Duration(days: days, minutes: minutes));
+          return dt.toIso8601String().replaceFirst('Z', '');
+        }
+        return null;
       }
+    case SYBMSDATE:
+    case SYBMSTIME:
+    case SYBMSDATETIME2:
+    case SYBMSDATETIMEOFFSET:
+      return _decodeDateTimeAll(type, bd!);
     case SYBCHAR:
     case SYBVARCHAR:
     case SYBTEXT:
-      {
-        final bytes = ptr.asTypedList(len);
-        if (_looksUtf16LeText(bytes)) return _utf16leDecode(bytes);
-        return utf8.decode(bytes, allowMalformed: true);
-      }
     case SYBNTEXT:
     case SYBNVARCHAR:
       {
-        // NVARCHAR/NTEXT are UTF-16LE; dbdatlen returns the byte length.
-        // Decode exactly [len] bytes as UTF-16LE.
         final bytes = ptr.asTypedList(len);
-        return _utf16leDecode(bytes);
+        return freeTdsTextCodec.decode(bytes);
       }
     // For DECIMAL/NUMERIC/DATETIME, you may need proper conversion against TDS metadata.
     default:
@@ -853,10 +928,9 @@ dynamic decodeDbValue(int type, Pointer<Uint8> ptr, int len) {
 ///
 /// Strategy:
 /// - First, call [decodeDbValue] for fast-path common types.
-/// - If the result is raw bytes (Uint8List), attempt to convert to a readable string
-///   via `dbconvert(..., SYBVARCHAR, ...)`.
-/// - For DECIMAL/NUMERIC specifically, try to coerce directly to double using
-///   `SYBFLT8` before falling back to string. This yields a native number shape.
+/// - Binary SQL types keep their Uint8List. For unhandled types returning raw
+///   bytes, attempt conversion via `dbconvert(..., SYBVARCHAR, ...)`.
+/// - DECIMAL/NUMERIC stay exact decimal strings; never round them to double.
 /// - As a last resort, base64-encode raw bytes for JSON-safety.
 dynamic decodeDbValueWithFallback(
   DBLib db,
@@ -867,26 +941,17 @@ dynamic decodeDbValueWithFallback(
 ) {
   // Prefer native decode first
   final v = decodeDbValue(type, ptr, len);
-  // Directly convert DECIMAL/NUMERIC to double if undecoded
-  if ((type == SYBDECIMAL || type == SYBNUMERIC) &&
-      v is Uint8List &&
-      ptr != nullptr &&
-      len > 0) {
-    final dest = malloc<Uint8>(8);
-    try {
-      final outLen = db.dbconvert(dbproc, type, ptr, len, SYBFLT8, dest, 8);
-      if (outLen == 8) {
-        return dest.cast<Double>().value;
-      }
-    } catch (_) {
-      // ignore and fall back to string
-    } finally {
-      malloc.free(dest);
-    }
-  }
-  if (v is Uint8List) {
+  if (v is Uint8List &&
+      type != SYBBINARY &&
+      type != SYBVARBINARY &&
+      type != SYBIMAGE) {
     final s = tryConvertToString(db, dbproc, type, ptr, len);
-    if (s != null) return s;
+    if (s != null) {
+      return s;
+    }
+    if (type == SYBDECIMAL || type == SYBNUMERIC) {
+      throw FormatException('Cannot decode an exact SQL decimal value');
+    }
     // Last resort: base64 the raw bytes for JSON-safety
     return base64.encode(v);
   }
@@ -920,11 +985,52 @@ String? tryConvertToString(
       maxLen,
     );
     if (outLen <= 0) return null;
+    if (outLen > maxLen) {
+      throw FormatException('Native text conversion exceeded its buffer');
+    }
     final bytes = dest.asTypedList(outLen);
-    return utf8.decode(bytes, allowMalformed: true);
+    return freeTdsTextCodec.decode(bytes);
+  } on FormatException {
+    rethrow;
   } catch (_) {
     return null;
   } finally {
     malloc.free(dest);
   }
+}
+
+String _scaledMoney(BigInt value) {
+  final digits = value.abs().toString().padLeft(5, '0');
+  return '${value.isNegative ? '-' : ''}${digits.substring(0, digits.length - 4)}.${digits.substring(digits.length - 4)}';
+}
+
+// DBDATETIMEALL: uint64 ticks (100 ns), int32 days, int16 offset, flags.
+// The protocol stores datetimeoffset date/time in UTC; present its civil time.
+String _decodeDateTimeAll(int type, ByteData data) {
+  if (data.lengthInBytes != 16) {
+    throw FormatException('Invalid DBDATETIMEALL length');
+  }
+  final ticks = data.getUint64(0, Endian.host);
+  final days = data.getInt32(8, Endian.host);
+  final offset = type == SYBMSDATETIMEOFFSET
+      ? data.getInt16(12, Endian.host)
+      : 0;
+  if (ticks >= 864000000000 || offset.abs() > 840) {
+    throw FormatException('Invalid DBDATETIMEALL value');
+  }
+  final civil = DateTime.utc(
+    1900,
+    1,
+    1,
+  ).add(Duration(days: days, microseconds: ticks ~/ 10, minutes: offset));
+  final date =
+      '${civil.year.toString().padLeft(4, '0')}-${civil.month.toString().padLeft(2, '0')}-${civil.day.toString().padLeft(2, '0')}';
+  if (type == SYBMSDATE) return date;
+  final time =
+      '${civil.hour.toString().padLeft(2, '0')}:${civil.minute.toString().padLeft(2, '0')}:${civil.second.toString().padLeft(2, '0')}.${(ticks % 10000000).toString().padLeft(7, '0')}';
+  if (type == SYBMSTIME) return time;
+  final zone = type == SYBMSDATETIMEOFFSET
+      ? '${offset < 0 ? '-' : '+'}${(offset.abs() ~/ 60).toString().padLeft(2, '0')}:${(offset.abs() % 60).toString().padLeft(2, '0')}'
+      : '';
+  return '${date}T$time$zone';
 }

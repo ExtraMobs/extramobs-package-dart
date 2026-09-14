@@ -1,4 +1,6 @@
-import 'package:mssql_connection/mssql_connection.dart';
+import 'dart:io';
+
+import 'package:mssql/mssql_connection.dart';
 import 'package:test/test.dart';
 
 import 'test_utils.dart';
@@ -6,30 +8,30 @@ import 'test_utils.dart';
 // Set RUN_DB_TESTS=1 in environment to enable tests that require a live DB + native libs.
 
 void main() {
+  final runDbTests = Platform.environment['RUN_DB_TESTS'] == '1';
   group('Negative cases - connection', () {
-
     // 1) IP address negative cases
     test('connect fails with empty IP', () async {
-      final conn = MssqlConnection.getInstance();
+      final conn = MssqlConnectionAsync.getInstance();
       final ok = await conn.connect(
         ip: '',
         port: '1433',
         databaseName: 'master',
         username: 'sa',
-        password: 'eSeal@123',
+        password: 'unused-test-password',
         timeoutInSeconds: 2,
       );
       expect(ok, isFalse);
     });
 
     test('connect fails with malformed IP/hostname', () async {
-      final conn = MssqlConnection.getInstance();
+      final conn = MssqlConnectionAsync.getInstance();
       final ok = await conn.connect(
         ip: 'invalid_host_name',
         port: '1433',
         databaseName: 'master',
         username: 'sa',
-        password: 'eSeal@123',
+        password: 'unused-test-password',
         timeoutInSeconds: 2,
       );
       expect(ok, isFalse);
@@ -37,88 +39,84 @@ void main() {
 
     // 2) Port negative cases
     test('connect fails with empty port', () async {
-      final conn = MssqlConnection.getInstance();
+      final conn = MssqlConnectionAsync.getInstance();
       final ok = await conn.connect(
         ip: '192.168.1.10',
         port: '',
         databaseName: 'master',
         username: 'sa',
-        password: 'eSeal@123',
+        password: 'unused-test-password',
         timeoutInSeconds: 2,
       );
       expect(ok, isFalse);
     });
 
     test('connect fails to unreachable port quickly', () async {
-      final conn = MssqlConnection.getInstance();
+      final conn = MssqlConnectionAsync.getInstance();
       final ok = await conn.connect(
         ip: '192.168.1.10',
         port: '1',
         databaseName: 'master',
         username: 'sa',
-        password: 'eSeal@123',
+        password: 'unused-test-password',
         timeoutInSeconds: 2,
       );
       expect(ok, isFalse);
     });
 
     test('connect fails with non-numeric port', () async {
-      final conn = MssqlConnection.getInstance();
+      final conn = MssqlConnectionAsync.getInstance();
       final ok = await conn.connect(
         ip: '192.168.1.10',
         port: 'abc',
         databaseName: 'master',
         username: 'sa',
-        password: 'eSeal@123',
+        password: 'unused-test-password',
         timeoutInSeconds: 2,
       );
       expect(ok, isFalse);
     });
 
     // 3) Database name negative case
-    test('connect fails when database does not exist', () async {
-      final conn = MssqlConnection.getInstance();
-      final ok = await conn.connect(
-        ip: '192.168.1.10',
-        port: '1433',
-        databaseName: 'db_does_not_exist_123',
-        username: 'sa',
-        password: 'eSeal@123',
-        timeoutInSeconds: 2,
+    test('missing database surfaces SQL error', () async {
+      final config = TestDbConfig.current;
+      final conn = MssqlConnectionAsync.getInstance();
+      addTearDown(conn.disconnect);
+      expect(await config.connect(conn), isTrue);
+      await expectLater(
+        runSql(conn, 'USE [db_does_not_exist_123]'),
+        throwsA(isA<SQLException>()),
       );
-      expect(ok, isFalse);
-    });
+      expect(conn.isConnected, isFalse);
+    }, skip: !runDbTests);
 
     // 4) Username negative case
     test('connect fails with empty username', () async {
-      final conn = MssqlConnection.getInstance();
+      final conn = MssqlConnectionAsync.getInstance();
       final ok = await conn.connect(
         ip: '192.168.1.10',
         port: '1433',
         databaseName: 'master',
         username: '',
-        password: 'eSeal@123',
+        password: 'unused-test-password',
         timeoutInSeconds: 2,
       );
       expect(ok, isFalse);
     });
 
     test('connect fails with wrong username (low timeout)', () async {
-      final conn = MssqlConnection.getInstance();
-      final ok = await conn.connect(
-        ip: '192.168.1.10',
-        port: '1433',
-        databaseName: 'master',
-        username: 'definitely-wrong',
-        password: 'eSeal@123',
-        timeoutInSeconds: 2,
+      final config = TestDbConfig.current;
+      final conn = MssqlConnectionAsync.getInstance();
+      addTearDown(conn.disconnect);
+      await expectLater(
+        config.connect(conn, username: 'definitely-wrong', timeoutInSeconds: 2),
+        throwsA(isA<SQLException>()),
       );
-      expect(ok, isFalse);
-    });
+    }, skip: !runDbTests);
 
     // 5) Password negative case
     test('connect fails with empty password', () async {
-      final conn = MssqlConnection.getInstance();
+      final conn = MssqlConnectionAsync.getInstance();
       final ok = await conn.connect(
         ip: '192.168.1.10',
         port: '1433',
@@ -131,39 +129,36 @@ void main() {
     });
 
     test('connect fails with wrong password (low timeout)', () async {
-      final conn = MssqlConnection.getInstance();
-      final ok = await conn.connect(
-        ip: '192.168.1.10',
-        port: '1433',
-        databaseName: 'master',
-        username: 'sa',
-        password: 'definitely-wrong',
-        timeoutInSeconds: 2,
+      final config = TestDbConfig.current;
+      final conn = MssqlConnectionAsync.getInstance();
+      addTearDown(conn.disconnect);
+      await expectLater(
+        config.connect(conn, password: 'definitely-wrong', timeoutInSeconds: 2),
+        throwsA(isA<SQLException>()),
       );
-      expect(ok, isFalse);
-    });
+    }, skip: !runDbTests);
     // 6) Timeout negative cases
     test('connect fails fast with zero timeout to unreachable port', () async {
-      final conn = MssqlConnection.getInstance();
+      final conn = MssqlConnectionAsync.getInstance();
       final ok = await conn.connect(
         ip: '192.168.1.10',
         port: '1',
         databaseName: 'master',
         username: 'sa',
-        password: 'eSeal@123',
+        password: 'unused-test-password',
         timeoutInSeconds: 0,
       );
       expect(ok, isFalse);
     });
 
     test('connect fails with negative timeout and bad port', () async {
-      final conn = MssqlConnection.getInstance();
+      final conn = MssqlConnectionAsync.getInstance();
       final ok = await conn.connect(
         ip: 'invalid_host_name',
         port: 'abc', // skip TCP probe; exercise dbopen path defensively
         databaseName: 'master',
         username: 'sa',
-        password: 'eSeal@123',
+        password: 'unused-test-password',
         timeoutInSeconds: -1,
       );
       expect(ok, isFalse);
@@ -173,8 +168,11 @@ void main() {
   group('Negative cases - SQL execution (syntax/semantics)', () {
     final harness = TempDbHarness();
 
+    setUp(() async {
+      if (!harness.client.isConnected) await harness.reconnect();
+    });
+
     setUpAll(() async {
-      
       await harness.init();
       await harness.recreateTable('''
         CREATE TABLE dbo.NegItems (
@@ -185,42 +183,32 @@ void main() {
     });
 
     tearDownAll(() async {
-      
       await harness.dispose();
     });
 
-    test('invalid SQL syntax throws SQLException (writeData)', () async {
-      
+    test('invalid write SQL throws SQLException', () async {
       await expectLater(
         harness.execute('SELEC 1'),
         throwsA(isA<SQLException>()),
       );
     });
 
-    test('invalid SQL syntax throws SQLException (getData)', () async {
-      
+    test('invalid read SQL throws SQLException', () async {
       await expectLater(
         harness.query('SELET * FROM dbo.NegItems'),
         throwsA(isA<SQLException>()),
       );
     });
 
-    test(
-      'missing parameter in executeParams returns error or throws',
-      () async {
-        
-        try {
-          final out = await harness.executeParams('SELECT @missingParam', {});
-          final m = parseJson(out);
-          expect(m.containsKey('error') || (m['rows'] as List).isEmpty, isTrue);
-        } on SQLException {
-          // acceptable: some providers surface this as an exception
-        }
-      },
-    );
+    test('missing parameter in executeParams throws SQLException', () async {
+      await expectLater(
+        harness.executeParams('SELECT @missingParam', {}),
+        throwsA(isA<SQLException>()),
+      );
+      expect(harness.client.isConnected, isFalse);
+    });
 
     test('type overflow via params surfaces error', () async {
-      
       // INT column can't store > INT32 max
       final tooBig = 9223372036854775807; // fits bigint, not int
       try {
@@ -235,33 +223,35 @@ void main() {
     });
 
     test('bulkInsert into non-existent table throws', () async {
-      
       final conn = harness.client;
       final rows = [
         {'id': 1, 'name': 'a'},
         {'id': 2, 'name': 'b'},
       ];
       await expectLater(
-        conn.bulkInsert('dbo.NoSuchTable', rows),
+        runBulk(conn, 'dbo.NoSuchTable', rows),
         throwsA(isA<SQLException>()),
       );
     });
 
     test('transaction rollback after error leaves table empty', () async {
-      
       final c = harness.client;
-      await c.beginTransaction();
-      try {
-        // wrong column name triggers error
-        await harness.execute(
-          "INSERT INTO dbo.NegItems (id, wrong_name) VALUES (1, N'x')",
-        );
-        fail('expected SQLException');
-      } catch (_) {
-        await c.rollback();
-      }
-      final rows = parseRows(await harness.query('SELECT * FROM dbo.NegItems'));
-      expect(rows, isEmpty);
+      await expectLater(
+        c.transaction((tx) async {
+          await runSql(
+            tx,
+            "INSERT INTO dbo.NegItems (id, wrong_name) VALUES (1, N'x')",
+          );
+        }),
+        throwsA(isA<SQLException>()),
+      );
+      // Native errors invalidate the session; reconnect explicitly to inspect.
+      expect(c.isConnected, isFalse);
+      await harness.reconnect();
+      final rows = parseRows(
+        await harness.query('SELECT COUNT(*) AS n FROM dbo.NegItems'),
+      );
+      expect(rows.single['n'], 0);
     });
   });
 
@@ -269,7 +259,6 @@ void main() {
     final harness = TempDbHarness();
 
     setUpAll(() async {
-      
       await harness.init();
       await harness.recreateTable('''
         CREATE TABLE dbo.Texts (
@@ -280,14 +269,12 @@ void main() {
     });
 
     tearDownAll(() async {
-      
       await harness.dispose();
     });
 
     test(
       'NVARCHAR parameters with non-ASCII characters are handled correctly',
       () async {
-        
         final unicode = 'こんにちは世界 👋';
         final affected = affectedCount(
           await harness.executeParams(
@@ -309,20 +296,20 @@ void main() {
 
   group('Offline API negative behavior (no DB)', () {
     test(
-      'getData without connect throws StateError when no saved params',
+      'query without connect throws StateError without reconnecting',
       () async {
-        final c = MssqlConnection.getInstance();
+        final c = MssqlConnectionAsync.getInstance();
         // Ensure disconnected
         await c.disconnect();
-        await expectLater(c.getData('SELECT 1'), throwsA(isA<StateError>()));
+        await expectLater(runSql(c, 'SELECT 1'), throwsA(isA<StateError>()));
       },
     );
 
-    test('writeDataWithParams without connect throws StateError', () async {
-      final c = MssqlConnection.getInstance();
+    test('parameterized write without connect throws StateError', () async {
+      final c = MssqlConnectionAsync.getInstance();
       await c.disconnect();
       await expectLater(
-        c.writeDataWithParams('SELECT @p', {'p': 1}),
+        runSql(c, 'SELECT @p', {'p': 1}),
         throwsA(isA<StateError>()),
       );
     });

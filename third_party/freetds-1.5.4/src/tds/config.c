@@ -777,6 +777,14 @@ tds_config_login(TDSLOGIN * connection, TDSLOGIN * login)
 	if (login->encryption_level)
 		connection->encryption_level = login->encryption_level;
 
+	/* Explicit wrapper trust settings override files and environment defaults. */
+	if (res && login->cafile_specified) {
+		res = tds_dstr_dup(&connection->cafile, &login->cafile);
+		connection->check_ssl_hostname = 1;
+	}
+	if (res && !tds_dstr_isempty(&login->certificate_host_name))
+		res = tds_dstr_dup(&connection->certificate_host_name, &login->certificate_host_name);
+
 	if (login->suppress_language)
 		connection->suppress_language = 1;
 

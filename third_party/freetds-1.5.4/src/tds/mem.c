@@ -1123,6 +1123,9 @@ tds_deinit_connection(TDSCONNECTION *conn)
 	while (conn->cursors)
 		tds_cursor_deallocated(conn, conn->cursors);
 	tds_ssl_deinit(conn);
+	free(conn->peer_certificate_der);
+	conn->peer_certificate_der = NULL;
+	conn->peer_certificate_der_len = 0;
 	/* close connection and free inactive sockets */
 	tds_connection_close(conn);
 	tds_wakeup_close(&conn->wakeup);

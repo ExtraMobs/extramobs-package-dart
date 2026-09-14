@@ -1,24 +1,71 @@
 import 'dart:async';
-
+import 'dart:isolate';
+import 'dart:io';
+import 'native_loader.dart';
+import 'sql_exception.dart';
+import 'sql_row.dart';
 import 'mssql_client.dart';
-import 'native_logger.dart';
+import 'tls_config.dart';
+import 'tls_certificate.dart';
+export 'sql_row.dart';
+export 'mssql_client.dart' show MssqlCursor, MssqlConnection, MssqlCursorSync;
+part 'async_client.dart';
 
-class MssqlConnection {
-  static final MssqlConnection _instance = MssqlConnection._internal();
-  factory MssqlConnection.getInstance() => _instance;
-  MssqlConnection._internal();
+/// Owns a session. getInstance preserves the original shared-instance entry point.
+class MssqlConnectionAsync {
+  static final _instance = MssqlConnectionAsync();
+  factory MssqlConnectionAsync.getInstance() => _instance;
+  MssqlConnectionAsync();
 
-  MssqlClient? _client;
+  /// Close all async sessions and stop the native worker permanently.
+  /// Await once at the end of a standalone Dart program, after all database work.
+  static Future<void> shutdownWorker() => _AsyncWorker.shutdown();
 
-  String? _ip;
-  String? _port;
-  String? _database;
-  String? _username;
-  String? _password;
-  int _timeoutInSeconds = 15;
-
+  _AsyncClient? _client;
+  Future<void> _tail = Future.value();
+  final Object _transactionKey = Object();
+  Object? _activeTransaction;
+  final _transactionCursors = <MssqlCursor>{};
   bool get isConnected => _client?.isConnected == true;
 
+  /// Received certificate, including login-only TLS; null after close/failure.
+  /// A copy saved by the caller remains valid after the connection closes.
+  TlsCertificate? get peerCertificate => _client?.peerCertificate;
+  bool get autocommit => _connected.autocommit;
+
+  Future<T> _schedule<T>(
+    FutureOr<T> Function() action, {
+    bool lifecycle = false,
+  }) {
+    final token = Zone.current[_transactionKey];
+    if (token != null) {
+      if (!identical(token, _activeTransaction)) {
+        return Future.error(StateError('Transaction has ended'));
+      }
+      if (lifecycle) {
+        return Future.error(
+          StateError(
+            'Cannot change the session or transaction mode inside transaction(callback)',
+          ),
+        );
+      }
+      return Future.sync(action);
+    }
+    final next = _tail.then((_) => action());
+    _tail = next.then<void>((_) {}, onError: (Object _, StackTrace _) {});
+    return next;
+  }
+
+  _AsyncClient get _connected {
+    final client = _client;
+    if (client == null || !client.isConnected) {
+      throw StateError('Not connected. Call connect() explicitly.');
+    }
+    return client;
+  }
+
+  /// Omit tls to use FreeTDS configuration and defaults. Strict mode requires
+  /// an explicit trust source and a server supporting TDS 8.0.
   Future<bool> connect({
     required String ip,
     required String port,
@@ -26,157 +73,169 @@ class MssqlConnection {
     required String username,
     required String password,
     int timeoutInSeconds = 15,
-  }) async {
-    // Basic input validation to prevent invalid dbopen calls and fail fast.
-    final _ipTrim = ip.trim();
-    final _portTrim = port.trim();
-    final _userTrim = username.trim();
-    final _pwd = password; // allow spaces in password
-    final _timeout = timeoutInSeconds < 0 ? 0 : timeoutInSeconds;
-
-    if (_ipTrim.isEmpty) {
-      MssqlLogger.w('connect(params) | invalid ip (empty)');
+    int queryTimeoutSeconds = 30,
+    TlsConfig? tls,
+    int maxResultRows = 100000,
+    int maxResultBytes = 64 * 1024 * 1024,
+    bool autocommit = false,
+  }) => _schedule(() async {
+    final host = ip.trim(), user = username.trim();
+    final portNumber = int.tryParse(port.trim());
+    if (host.isEmpty ||
+        user.isEmpty ||
+        password.isEmpty ||
+        portNumber == null ||
+        portNumber < 1 ||
+        portNumber > 65535 ||
+        timeoutInSeconds <= 0) {
       return false;
     }
-    if (_portTrim.isEmpty) {
-      MssqlLogger.w('connect(params) | invalid port (empty)');
-      return false;
-    }
-    final portNum = int.tryParse(_portTrim);
-    if (portNum == null || portNum <= 0 || portNum > 65535) {
-      MssqlLogger.w('connect(params) | invalid port (non-numeric or out-of-range): $_portTrim');
-      return false;
-    }
-    if (_userTrim.isEmpty) {
-      MssqlLogger.w('connect(params) | invalid username (empty)');
-      return false;
-    }
-    if (_pwd.isEmpty) {
-      MssqlLogger.w('connect(params) | invalid password (empty)');
-      return false;
-    }
-
-    _ip = _ipTrim;
-    _port = _portTrim;
-    _database = databaseName;
-    _username = _userTrim;
-    _password = _pwd;
-    _timeoutInSeconds = _timeout;
-
-    try {
-      final server = '$_ipTrim:$_portTrim';
-      _client = MssqlClient(
-        server: server,
-        username: _userTrim,
-        password: _pwd,
-      );
-      final ok = await _client!.connect(loginTimeoutSeconds: _timeout);
-      if (!ok) return false;
-
-      // Select database for this session.
-      if (databaseName.isNotEmpty) {
-        await _client!.execute('USE [${_escapeBrackets(databaseName)}]');
-        // If USE fails, subsequent queries will fail accordingly.
-        MssqlLogger.i('Switched database to $databaseName');
-      }
-      return true;
-    } catch (e, st) {
-      MssqlLogger.e('connect failed: $e\n$st');
-      return false;
-    }
-  }
-
-  Future<String> getData(String query) async {
-    await _ensureConnectedOrReconnect();
-    return _client!.execute(query);
-  }
-
-  Future<String> writeData(String query) async {
-    await _ensureConnectedOrReconnect();
-    return _client!.execute(query);
-  }
-
-  Future<String> getDataWithParams(
-    String query,
-    Map<String, dynamic> params,
-  ) async {
-    await _ensureConnectedOrReconnect();
-    return _client!.executeParams(query, params);
-  }
-
-  Future<String> writeDataWithParams(
-    String query,
-    Map<String, dynamic> params,
-  ) async {
-    await _ensureConnectedOrReconnect();
-    return _client!.executeParams(query, params);
-  }
-
-  Future<int> bulkInsert(
-    String tableName,
-    List<Map<String, dynamic>> rows, {
-    List<String>? columns,
-    int batchSize = 1000,
-  }) async {
-    await _ensureConnectedOrReconnect();
-    return _client!.bulkInsert(
-      tableName,
-      rows,
-      columns: columns,
-      batchSize: batchSize,
+    final dbName = databaseName.isEmpty
+        ? null
+        : quoteSqlIdentifier(databaseName);
+    final address = host.contains(':') && !host.startsWith('[')
+        ? '[$host]'
+        : host;
+    await _client?.close();
+    _client = null;
+    final candidate = _AsyncClient(
+      server: '$address:$portNumber',
+      username: user,
+      password: password,
+      tls: tls,
+      queryTimeoutSeconds: queryTimeoutSeconds,
+      maxResultRows: maxResultRows,
+      maxResultBytes: maxResultBytes,
+      autocommit: autocommit,
     );
-  }
-
-  Future<bool> disconnect() async {
     try {
-      await _client?.close();
+      if (!await candidate.connect(loginTimeoutSeconds: timeoutInSeconds)) {
+        return false;
+      }
+      if (dbName != null) await _control(candidate, 'USE $dbName');
+      _client = candidate;
       return true;
     } catch (_) {
-      return false;
+      await candidate.close();
+      rethrow;
+    }
+  }, lifecycle: true);
+
+  /// Creates an idle cursor. Execute and fetch on it; close it in finally.
+  MssqlCursor cursor() {
+    final token = Zone.current[_transactionKey];
+    _validateCursorTransaction(token);
+    final current = _connected.cursor(
+      validate: () => _validateCursorTransaction(token),
+      schedule: _schedule,
+      validateTransactionControl: () {
+        if (Zone.current[_transactionKey] != null) {
+          throw StateError(
+            'Cannot commit or roll back inside transaction(callback)',
+          );
+        }
+      },
+    );
+    if (token != null) _transactionCursors.add(current);
+    return current;
+  }
+
+  void _validateCursorTransaction(Object? token) {
+    if (token != null &&
+        (!identical(token, _activeTransaction) ||
+            !identical(token, Zone.current[_transactionKey]))) {
+      throw StateError('Cursor must be used in its active transaction');
+    }
+  }
+
+  /// pyodbc-style convenience: creates, executes and returns a new cursor.
+  Future<MssqlCursor> execute(String sql, [Object? parameters]) async {
+    final current = cursor();
+    try {
+      return await current.execute(sql, parameters);
+    } catch (_) {
+      await current.close();
+      rethrow;
+    }
+  }
+
+  Future<void> _control(_AsyncClient client, String sql) async {
+    final current = await client.execute(sql);
+    try {
+      while (await current.nextset()) {}
     } finally {
-      _client = null;
-      // Clear saved params so offline calls do not attempt implicit reconnect
-      _ip = null;
-      _port = null;
-      _database = null;
-      _username = null;
-      _password = null;
+      await current.close();
     }
   }
 
-  // Basic transaction helpers (optional, convenience)
-  Future<void> beginTransaction() async {
-    await writeData('BEGIN TRAN');
+  Future<bool> disconnect() => _schedule(() async {
+    final client = _client;
+    _client = null;
+    await client?.close();
+    return true;
+  }, lifecycle: true);
+
+  /// Closes the session and invalidates all its cursors.
+  Future<void> close() async {
+    await disconnect();
   }
 
-  Future<void> commit() async {
-    await writeData('COMMIT');
-  }
+  /// Applies to all cursors on this connection. Fetch/cancel pending results first.
+  Future<void> commit() =>
+      _schedule(() => _connected.commit(), lifecycle: true);
 
-  Future<void> rollback() async {
-    await writeData('ROLLBACK');
-  }
+  Future<void> rollback() =>
+      _schedule(() => _connected.rollback(), lifecycle: true);
 
-  Future<void> _ensureConnectedOrReconnect() async {
-    if (_client?.isConnected == true) return;
-    // Attempt reconnection using last known parameters if available
-    if (_ip != null &&
-        _port != null &&
-        _database != null &&
-        _username != null &&
-        _password != null) {
-      await connect(
-        ip: _ip!,
-        port: _port!,
-        databaseName: _database!,
-        username: _username!,
-        password: _password!,
-        timeoutInSeconds: _timeoutInSeconds,
-      );
-      return;
+  /// Enabling autocommit commits pending work. Async equivalent of assigning
+  /// pyodbc's autocommit property; state changes only after the native call succeeds.
+  Future<void> setAutocommit(bool value) =>
+      _schedule(() => _connected.setAutocommit(value), lifecycle: true);
+
+  /// Reserves the session for the entire callback, including its awaits.
+  /// Calls outside its Zone wait; callbacks used after completion are rejected.
+  /// Requires autocommit=true. Errors roll back; native failures close the session.
+  Future<T> transaction<T>(Future<T> Function(MssqlConnectionAsync tx) action) {
+    if (Zone.current[_transactionKey] != null) {
+      return Future.error(StateError('Nested transactions are not supported'));
     }
-    throw StateError('Not connected. Call connect() first.');
+    return _schedule(() async {
+      final client = _connected;
+      if (!client.autocommit) {
+        throw StateError(
+          'transaction(callback) requires autocommit=true; use commit()/rollback() in manual mode',
+        );
+      }
+      final token = Object();
+      await _control(client, 'BEGIN TRAN');
+      _activeTransaction = token;
+      try {
+        final T result;
+        try {
+          result = await runZoned(
+            () => action(this),
+            zoneValues: {_transactionKey: token},
+          );
+        } finally {
+          _activeTransaction = null;
+          for (final cursor in _transactionCursors.toList()) {
+            await cursor.close();
+          }
+          _transactionCursors.clear();
+        }
+        await _control(client, 'COMMIT');
+        return result;
+      } catch (_) {
+        _activeTransaction = null;
+        if (client.isConnected) {
+          try {
+            await _control(client, 'ROLLBACK');
+          } catch (_) {
+            await client.close();
+          }
+        }
+        rethrow;
+      }
+    });
   }
-
-  static String _escapeBrackets(String name) => name.replaceAll(']', ']]');
 }

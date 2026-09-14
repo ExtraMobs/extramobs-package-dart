@@ -36,10 +36,13 @@ dependencies:
   cupertino_icons: ^1.0.8
 
   # Depend on the current package via a local path
-  mssql_connection:
+  mssql:
     path: ..
 
 dev_dependencies:
+  integration_test:
+    sdk: flutter
+  test: ^1.25.6
   flutter_test:
     sdk: flutter
 

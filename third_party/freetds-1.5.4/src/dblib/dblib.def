@@ -1,4 +1,6 @@
 EXPORTS
+	sql_server_wrapper_init
+	sql_server_wrapper_peer_certificate
 	bcp_batch
 	bcp_bind
 	bcp_colfmt

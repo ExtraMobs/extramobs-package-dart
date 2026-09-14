@@ -1,995 +1,716 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
-import 'dart:math';
 import 'dart:typed_data';
-
 import 'package:ffi/ffi.dart';
-
 import 'ffi/freetds_bindings.dart';
-import 'native_logger.dart';
+import 'ffi/freetds_text.dart';
 import 'sql_exception.dart';
+import 'sql_row.dart';
+import 'tls_config.dart';
+import 'tls_certificate.dart';
 
+import 'mssql_cursor.dart';
+export 'mssql_cursor.dart';
+
+part 'native_cursor.dart';
+part 'sync_connection.dart';
+
+/// One serialized DB-Lib session. Native calls block the owning isolate.
 class MssqlClient {
-  final String server;
-  final String username;
-  final String password;
-
+  final String server, username, password;
+  final TlsConfig? tls;
+  TlsCertificate? _peerCertificate;
+  TlsCertificate? get peerCertificate => _peerCertificate;
+  final int queryTimeoutSeconds, maxResultRows, maxResultBytes;
   DBLib? _db;
   Pointer<DBPROCESS>? _dbproc;
-  bool _connected = false;
+  Future<void> _tail = Future.value();
+  final _cursors = <_NativeCursor>{};
+  _NativeCursor? _activeCursor;
+  bool _autocommit;
 
   MssqlClient({
     required this.server,
     required this.username,
     required this.password,
-  });
+    this.tls,
+    this.queryTimeoutSeconds = 30,
+    this.maxResultRows = 100000,
+    this.maxResultBytes = 64 * 1024 * 1024,
+    bool autocommit = false,
+    DBLib? dbLib,
+  }) : _db = dbLib,
+       _autocommit = autocommit;
 
-  bool get isConnected => _connected;
+  bool get autocommit => _autocommit;
 
-  /// Establish a DB-Lib connection to [server] using [username]/[password].
-  ///
-  /// Steps:
-  /// 1) Load and initialize DB-Lib (dbinit)
-  /// 1.1) Set login timeout via dbsetlogintime([loginTimeoutSeconds])
-  /// 2) Allocate a LOGINREC (dblogin)
-  /// 3) Set credentials (dbsetluser/dbsetlpwd)
-  /// 4) Enable BCP option on the login (best-effort)
-  /// 5) Open a DBPROCESS to the server (dbopen)
-  ///
-  /// Returns true on success; false if any step fails. All native buffers
-  /// for username/password/server are freed after use.
-  ///
-  /// [loginTimeoutSeconds] controls how long DB-Lib waits to establish a socket
-  /// connection/login before failing. Default is 15 seconds.
-  ///
-  /// Logging: emits lines in the form `connect | key=value | ...` for traceability.
-  Future<bool> connect({int loginTimeoutSeconds = 15}) async {
-    if (_connected) {
-      MssqlLogger.i('connect | already-connected=true');
-      return true;
+  bool get isConnected => _dbproc != null;
+  Future<T> _run<T>(FutureOr<T> Function() action) {
+    final next = _tail.then((_) => action());
+    _tail = next.then<void>((_) {}, onError: (Object _, StackTrace _) {});
+    return next;
+  }
+
+  T _checked<T>(String operation, T Function() action, bool Function(T) ok) {
+    final (value, diagnostics) = DBLib.captureDiagnostics(action);
+    if (!ok(value)) {
+      throw SQLException(
+        '$operation failed${diagnostics.isEmpty ? '.' : ': ${diagnostics.join(' | ')}'}',
+      );
     }
+    return value;
+  }
+
+  void _check(String operation, int Function() action) =>
+      _checked<int>(operation, action, (rc) => rc == SUCCEED);
+
+  Future<bool> connect({int loginTimeoutSeconds = 15}) =>
+      _run(() => _connectSync(loginTimeoutSeconds: loginTimeoutSeconds));
+
+  bool _connectSync({int loginTimeoutSeconds = 15}) {
+    if (isConnected) return true;
+    if (loginTimeoutSeconds <= 0 ||
+        loginTimeoutSeconds > 0x7fffffff ||
+        queryTimeoutSeconds <= 0 ||
+        queryTimeoutSeconds > 0x7fffffff ||
+        maxResultRows <= 0 ||
+        maxResultBytes <= 0) {
+      throw ArgumentError(
+        'Timeouts must fit a positive signed 32-bit integer; result limits must be positive',
+      );
+    }
+    final policy = tls;
+    final trust = switch (policy) {
+      TlsWithTrust(:final trust) => trust,
+      _ => null,
+    };
+    final hostname = switch (policy) {
+      TlsWithTrust(:final certificateHostname) => certificateHostname,
+      _ => null,
+    };
+    final caFile = switch (trust) {
+      TlsSystemTrust() => 'system',
+      TlsPemTrust(:final path) => path,
+      null => '',
+    };
+    for (final text in [server, username, password, caFile, hostname ?? '']) {
+      if (text.contains('\u0000')) {
+        throw ArgumentError('Login fields cannot contain NUL');
+      }
+    }
+    if (server.isEmpty || username.isEmpty || password.isEmpty) {
+      throw ArgumentError('Server and credentials must be specified');
+    }
+    if (trust is TlsPemTrust && (caFile.isEmpty || !File(caFile).isAbsolute)) {
+      throw ArgumentError('The PEM file must have an absolute path');
+    }
+    if (hostname != null && hostname.isEmpty) {
+      throw ArgumentError('certificateHostname cannot be empty');
+    }
+    final hp = _splitHostPort(server);
+    final db = _db ??= DBLib.load();
+    _check(
+      'DB-Lib initialization (one owning isolate required)',
+      () => db.initialize(kErrHandlerPtr, kMsgHandlerPtr),
+    );
+    _check('dbsetlogintime', () => db.dbsetlogintime(loginTimeoutSeconds));
+    final login = _checked('dblogin', db.dblogin, (p) => p != nullptr);
     try {
-      MssqlLogger.i('connect | op=init | status=start');
-      // Preflight: if server string looks like host:port, try a quick TCP probe
-      final hp = _splitHostPort(server);
-      if (hp != null) {
-        final ok = await _probeTcp(
-          hp.$1,
-          hp.$2,
-          Duration(seconds: loginTimeoutSeconds),
+      using((arena) {
+        Pointer<Utf8> text(String value) =>
+            toNativeFreeTdsText(value, allocator: arena);
+        _check(
+          'dbsetlcharset',
+          () => db.dbsetlcharset(login, text(freeTdsClientCharset)),
         );
-        if (!ok) {
-          MssqlLogger.w(
-            'connect | op=probe | host=${hp.$1} | port=${hp.$2} | reachable=false',
+        _check('dbsetluser', () => db.dbsetluser(login, text(username)));
+        _check('dbsetlpwd', () => db.dbsetlpwd(login, text(password)));
+        // An omitted policy leaves FreeTDS files/environment/defaults intact.
+        if (policy != null) {
+          _check(
+            'DBSETCAFILE',
+            () => db.dbsetlname(login, text(caFile), DBSETCAFILE),
           );
-          return false;
-        }
-        MssqlLogger.i(
-          'connect | op=probe | host=${hp.$1} | port=${hp.$2} | reachable=true',
-        );
-      }
-      _db ??= DBLib.load();
-      _db!.dbinit();
-      // Install handlers early so DB-Lib won't use its default fatal handler on errors in dbopen.
-      try {
-        _db!.dberrhandle(kErrHandlerPtr);
-        _db!.dbmsghandle(kMsgHandlerPtr);
-        MssqlLogger.i('connect | op=handlers | status=installed');
-      } catch (e) {
-        MssqlLogger.w('connect | op=handlers | error=$e');
-      }
-
-      // Configure login timeout (best set before attempting to connect)
-      try {
-        final rc = _db!.dbsetlogintime(loginTimeoutSeconds);
-        MssqlLogger.i(
-          'connect | op=dbsetlogintime | seconds=$loginTimeoutSeconds | rc=$rc',
-        );
-      } catch (e) {
-        MssqlLogger.w('connect | op=dbsetlogintime | error=$e');
-      }
-
-      MssqlLogger.i('connect | op=dblogin');
-      final login = _db!.dblogin();
-      if (login == nullptr) {
-        MssqlLogger.e('connect | op=dblogin | error=nullptr');
-        return false;
-      }
-
-      final u = username.toNativeUtf8();
-      final p = password.toNativeUtf8();
-      try {
-        MssqlLogger.i('connect | op=dbsetluser');
-        final su = _db!.dbsetluser(login, u);
-        MssqlLogger.i('connect | op=dbsetluser | rc=$su');
-
-        MssqlLogger.i('connect | op=dbsetlpwd');
-        final sp = _db!.dbsetlpwd(login, p);
-        MssqlLogger.i('connect | op=dbsetlpwd | rc=$sp');
-
-        if (su != SUCCEED || sp != SUCCEED) {
-          MssqlLogger.e(
-            'connect | op=credentials | su=$su | sp=$sp | error=fail',
+          final mode = switch (policy) {
+            TlsOff() => 'off',
+            TlsRequest() => 'request',
+            TlsRequire() => 'require',
+            TlsStrict() => 'strict',
+          };
+          _check(
+            'DBSETENCRYPTION',
+            () => db.dbsetlname(login, text(mode), DBSETENCRYPTION),
           );
-          return false;
-        }
-
-        // Enable BCP on this login so that bulk insert APIs are available on the session.
-        try {
-          final rcBcp = _db!.dbsetlbool(login, DBSETBCP, 1);
-          MssqlLogger.i(
-            'connect | op=dbsetlbool | option=DBSETBCP | value=1 | rc=$rcBcp',
-          );
-        } catch (e) {
-          MssqlLogger.w(
-            'connect | op=dbsetlbool | option=DBSETBCP | value=1 | error=$e',
-          );
-        }
-      } finally {
-        malloc.free(u);
-        malloc.free(p);
-      }
-
-      final srv = server.toNativeUtf8();
-      try {
-        MssqlLogger.i('connect | op=dbopen | server=$server');
-        _dbproc = _db!.dbopen(login, srv);
-      } finally {
-        malloc.free(srv);
-      }
-
-      if (_dbproc == nullptr) {
-        MssqlLogger.e('connect | op=dbopen | server=$server | error=nullptr');
-        return false;
-      }
-
-      // Increase TEXT/NTEXT retrieval limit to avoid 4096-byte default truncation.
-      // Use T-SQL SET TEXTSIZE to ensure compatibility across DB-Lib variants.
-      try {
-        const String cmdText = 'SET TEXTSIZE 2147483647';
-        final setPtr = cmdText.toNativeUtf8();
-        try {
-          final rc1 = _db!.dbcmd(_dbproc!, setPtr);
-          MssqlLogger.i('connect | op=dbcmd | sql=SET TEXTSIZE | rc=$rc1');
-          if (rc1 == SUCCEED) {
-            final rc2 = _db!.dbsqlexec(_dbproc!);
-            MssqlLogger.i('connect | op=dbsqlexec | rc=$rc2');
-            if (rc2 == SUCCEED) {
-              // Drain the SET batch quietly
-              _collectResults(_db!, _dbproc!);
-            }
+          if (trust != null) {
+            _check(
+              'DBSETCERTIFICATEHOSTNAME',
+              () => db.dbsetlname(
+                login,
+                text(hostname ?? hp?.$1 ?? server),
+                DBSETCERTIFICATEHOSTNAME,
+              ),
+            );
           }
-        } finally {
-          malloc.free(setPtr);
         }
-      } catch (e) {
-        MssqlLogger.w('connect | op=set-textsize | error=$e');
-      }
-
-      _connected = true;
-      MssqlLogger.i('connect | status=connected | server=$server');
-      return true;
-    } catch (e, st) {
-      MssqlLogger.e('connect | exception=$e');
-      MssqlLogger.w('connect | stacktrace=\n$st');
-      return false;
-    }
-  }
-
-  // Parse a host:port string into (host, port). Returns null if not in that form.
-  (String, int)? _splitHostPort(String s) {
-    final idx = s.lastIndexOf(':');
-    if (idx <= 0 || idx == s.length - 1) return null;
-    final host = s.substring(0, idx);
-    final pStr = s.substring(idx + 1);
-    final port = int.tryParse(pStr);
-    if (port == null) return null;
-    return (host, port);
-  }
-
-  // Attempt a TCP connection to host:port within [timeout].
-  Future<bool> _probeTcp(String host, int port, Duration timeout) async {
-    try {
-      final sock = await Socket.connect(host, port, timeout: timeout);
-      // Immediately dispose; this is a reachability probe only.
-      await sock.close();
+        _check('DBSETBCP', () => db.dbsetlbool(login, 1, DBSETBCP));
+        _dbproc = _checked(
+          'dbopen',
+          () => db.dbopen(login, text(server)),
+          (p) => p != nullptr,
+        );
+        final length = db.peerCertificate(_dbproc!, nullptr, 0);
+        if (length < 0) {
+          throw SQLException('Failed to read the peer certificate');
+        }
+        if (length > 0) {
+          final bytes = arena<Uint8>(length);
+          if (db.peerCertificate(_dbproc!, bytes, length) != length) {
+            throw SQLException('Failed to copy the peer certificate');
+          }
+          _peerCertificate = TlsCertificate(bytes.asTypedList(length));
+        }
+        _check(
+          'DBSETTIME',
+          () =>
+              db.dbsetopt(_dbproc!, DBSETTIME, text('$queryTimeoutSeconds'), 0),
+        );
+      });
+      _command(
+        'SET TEXTSIZE 2147483647; SET ANSI_NULLS ON; SET QUOTED_IDENTIFIER ON; '
+        'SET ANSI_PADDING ON; SET ANSI_WARNINGS ON; SET CONCAT_NULL_YIELDS_NULL ON; '
+        'SET ARITHABORT ON; SET NUMERIC_ROUNDABORT OFF; '
+        'SET IMPLICIT_TRANSACTIONS ${_autocommit ? 'OFF' : 'ON'};',
+      );
       return true;
     } catch (_) {
-      return false;
-    }
-  }
-
-  /// Close the active DBPROCESS if connected and mark the client disconnected.
-  ///
-  /// Behavior:
-  /// - If no active connection exists, returns immediately (idempotent).
-  /// - Calls dbclose(DBPROCESS*) and logs the return code.
-  /// - Clears the internal DBPROCESS pointer and connected flag.
-  ///
-  /// Note: This does not call dbexit(); the library remains loaded for reuse.
-  /// Logging: emits lines in the form `close | key=value | ...` for traceability.
-  Future<void> close() async {
-    MssqlLogger.i('close | requested=true');
-    if (_dbproc == null || _dbproc == nullptr) {
-      _connected = false;
-      MssqlLogger.i('close | no-active=true | status=disconnected');
-      return;
-    }
-    try {
-      MssqlLogger.i('close | op=dbclose');
-      final rc = _db!.dbclose(_dbproc!);
-      MssqlLogger.i('close | op=dbclose | rc=$rc');
-    } catch (e) {
-      MssqlLogger.w('close | op=dbclose | error=$e');
+      _close();
+      rethrow;
     } finally {
-      _dbproc = null;
-      _connected = false;
-      MssqlLogger.i('close | status=disconnected');
+      db.dbloginfree(login);
     }
   }
 
-  /// Bulk insert rows into [tableName].
-  ///
-  /// [rows] should be a non-empty list of homogeneous maps.
-  /// If [columns] is not provided, the keys of the first row (iteration order)
-  /// are used as the column order.
-  /// Returns the number of rows successfully copied.
-  Future<int> bulkInsert(
+  Future<void> close() => _run(_close);
+
+  void _commit() => _command('WHILE @@TRANCOUNT > 0 COMMIT TRAN');
+  Future<void> commit() => _run(_commit);
+
+  void _rollback() => _command('IF @@TRANCOUNT > 0 ROLLBACK TRAN');
+  Future<void> rollback() => _run(_rollback);
+
+  Future<void> setAutocommit(bool value) => _run(() {
+    if (!isConnected) throw StateError('Not connected');
+    if (value == _autocommit) return;
+    if (value) _commit();
+    _command('SET IMPLICIT_TRANSACTIONS ${value ? 'OFF' : 'ON'}');
+    _autocommit = value;
+  });
+  void _close() {
+    _peerCertificate = null;
+    final proc = _dbproc;
+    _dbproc = null;
+    for (final cursor in _cursors.toList()) {
+      cursor._finish();
+    }
+    _activeCursor = null;
+    if (proc != null) {
+      try {
+        _db!.dbclose(proc);
+      } finally {
+        DBLib.takeLastMessage(proc);
+        DBLib.takeLastError(proc);
+      }
+    }
+  }
+
+  T _operation<T>(T Function(DBLib, Pointer<DBPROCESS>) action) {
+    final proc = _dbproc;
+    if (proc == null) {
+      throw SQLException('Not connected. Call connect() first.');
+    }
+    DBLib.takeLastError(proc);
+    DBLib.takeLastMessage(proc);
+    try {
+      return action(_db!, proc);
+    } catch (_) {
+      // Closing aborts native buffers/BCP and rolls back any transaction.
+      _close();
+      rethrow;
+    }
+  }
+
+  Future<MssqlCursor> execute(String sql, [Object? parameters]) async {
+    final current = cursor();
+    try {
+      return await current.execute(sql, parameters);
+    } catch (_) {
+      await current.close();
+      rethrow;
+    }
+  }
+
+  void _command(String sql, [Object? parameters]) {
+    final current = _cursor();
+    try {
+      current._execute(sql, parameters);
+      current._drain();
+    } finally {
+      current._close();
+    }
+  }
+
+  void _sendSql(String sql) {
+    if (sql.contains('\u0000')) throw ArgumentError('SQL cannot contain NUL');
+    _operation(
+      (db, proc) => using((arena) {
+        _check(
+          'dbcmd',
+          () => db.dbcmd(proc, toNativeFreeTdsText(sql, allocator: arena)),
+        );
+        _check('dbsqlexec', () => db.dbsqlexec(proc));
+      }),
+    );
+  }
+
+  List<(String, dynamic)> _sqlParams(String sql, Object params) {
+    if (params is List) {
+      final bound = _bindPositional(sql, params);
+      sql = bound.$1;
+      params = bound.$2;
+    }
+    if (params is! Map<String, dynamic>) {
+      throw ArgumentError(
+        'Parameters must be a List or a Map<String, dynamic>',
+      );
+    }
+    final norm = _normalizeParams(params, limit: 2098);
+    // Positional user arguments cannot collide with the built-in @stmt/@params.
+    return [
+      ('@stmt', sql),
+      (
+        '@params',
+        norm.entries
+            .map((e) => '${e.key} ${_inferSqlType(e.value)}')
+            .join(', '),
+      ),
+      for (final value in norm.values) ('', value),
+    ];
+  }
+
+  void _sendRpc(String name, List<(String, dynamic)> params) => using((arena) {
+    final rpcName = toNativeFreeTdsText(name, allocator: arena);
+    // Validate and encode before starting RPC; retain all buffers through send.
+    final values = [
+      for (final (key, value) in params)
+        (
+          toNativeFreeTdsText(key, allocator: arena),
+          _encodeForRpc(value, arena),
+        ),
+    ];
+    return _operation((db, proc) {
+      _check('dbrpcinit', () => db.dbrpcinit(proc, rpcName, 0));
+      for (final (key, value) in values) {
+        _check(
+          'dbrpcparam',
+          () => db.dbrpcparam(
+            proc,
+            key,
+            value.ptr != nullptr && value.length == 0 ? DBRPCEMPTY : 0,
+            value.type,
+            -1,
+            value.length,
+            value.ptr,
+          ),
+        );
+      }
+      _check('dbrpcsend', () => db.dbrpcsend(proc));
+      _check('dbsqlok', () => db.dbsqlok(proc));
+    });
+  });
+
+  /// Creates an idle cursor; commands are serialized when executed.
+  MssqlCursor cursor({
+    void Function()? validate,
+    Future<T> Function<T>(FutureOr<T> Function())? schedule,
+    void Function()? validateTransactionControl,
+  }) => _cursor(
+    validate: validate,
+    schedule: schedule,
+    validateTransactionControl: validateTransactionControl,
+  );
+
+  _NativeCursor _cursor({
+    void Function()? validate,
+    Future<T> Function<T>(FutureOr<T> Function())? schedule,
+    void Function()? validateTransactionControl,
+  }) {
+    final proc = _dbproc;
+    if (proc == null) throw StateError('Not connected. Call connect() first.');
+    final current = _NativeCursor(
+      this,
+      _db!,
+      proc,
+      validate,
+      schedule,
+      validateTransactionControl,
+    );
+    _cursors.add(current);
+    return current;
+  }
+
+  /// Manual mode uses RPC INSERTs so the connection owns the entire transaction.
+  /// Autocommit may preserve completed rows/batches if a later row fails.
+  int _bulkInsert(
     String tableName,
     List<Map<String, dynamic>> rows, {
     List<String>? columns,
     int batchSize = 1000,
-  }) async {
-    _ensureConnected();
+  }) {
+    final table = quoteSqlName(tableName);
+    if (batchSize <= 0) throw ArgumentError.value(batchSize, 'batchSize');
     if (rows.isEmpty) return 0;
-    final db = _db!;
-    final dbproc = _dbproc!;
-
-    // If inserting into a temp table (e.g., #tmp), fall back to parameterized INSERTs.
-    // BCP into temp tables is not consistently supported and can cause instability.
-    final tn = tableName.trim();
-    if (tn.startsWith('#')) {
-      final cols = (columns != null && columns.isNotEmpty)
-          ? List<String>.from(columns)
-          : rows.first.keys.toList(growable: false);
-      int total = 0;
+    final cols = columns ?? rows.first.keys.toList();
+    if (cols.isEmpty || cols.toSet().length != cols.length) {
+      throw ArgumentError('Columns must be nonempty and unique');
+    }
+    final columnSql = cols.map(quoteSqlIdentifier).join(', ');
+    for (final row in rows) {
+      if (cols.any((c) => !row.containsKey(c))) {
+        throw ArgumentError('Missing bulk column');
+      }
+    }
+    final types = [for (final col in cols) _bulkType(rows.map((r) => r[col]))];
+    var useBcp =
+        _autocommit && !table.startsWith('[#') && !types.contains(null);
+    if (useBcp) {
+      final metadata = _cursor();
+      late final List<String> actual;
+      try {
+        metadata._execute('SELECT @@TRANCOUNT', null);
+        useBcp = metadata._native(() => metadata._rows.fetchone()!.single) == 0;
+        metadata._drain();
+        metadata._execute('SELECT TOP (0) * FROM $table', null);
+        actual = metadata.columns!;
+        metadata._drain();
+      } finally {
+        metadata._close();
+      }
+      useBcp =
+          useBcp &&
+          actual.length == cols.length &&
+          List.generate(
+            cols.length,
+            (i) => actual[i] == cols[i],
+          ).every((v) => v);
+    }
+    if (!useBcp) {
+      // ponytail: one INSERT per row; optimize only with a charset-aware bulk path.
       for (final row in rows) {
-        final colList = cols
-            .map((c) => '[${c.replaceAll(']', ']]')}]')
-            .join(', ');
-        final placeholders = cols.map((c) => '@$c').join(', ');
-        final sql = 'INSERT INTO $tableName ($colList) VALUES ($placeholders)';
-        final pm = <String, dynamic>{};
-        for (final c in cols) {
-          pm['@$c'] = row[c];
-        }
-        final res = await executeParams(sql, pm);
-        try {
-          final j = jsonDecode(res);
-          final affected = (j['affected'] is int) ? j['affected'] as int : 0;
-          if (affected > 0) total += 1;
-        } catch (_) {
-          // On parse error, assume failure for that row
-        }
+        // Untyped Dart null has no SQL type. A NULL literal lets the target
+        // column determine it, including binary columns that reject NVARCHAR.
+        final values = List.generate(
+          cols.length,
+          (i) => row[cols[i]] == null ? 'NULL' : '@p$i',
+        ).join(', ');
+        final sql = 'INSERT INTO $table ($columnSql) VALUES ($values)';
+        _command(sql, {
+          for (var i = 0; i < cols.length; i++)
+            if (row[cols[i]] != null) 'p$i': row[cols[i]],
+        });
       }
-      return total;
+      return rows.length;
     }
-
-    // Determine columns
-    final cols = (columns != null && columns.isNotEmpty)
-        ? List<String>.from(columns)
-        : rows.first.keys.toList(growable: false);
-
-    // Initialize BCP
-    final tbl = tableName.toNativeUtf8();
-    try {
-      final rcInit = db.bcp_init(dbproc, tbl, nullptr, nullptr, DB_IN);
-      if (rcInit != SUCCEED) {
-        throw SQLException('bcp_init failed for $tableName');
-      }
-
-      // Bind columns with host types; varaddr NULL, varlen -1, no terminator
-      final hostTypes = <int>[];
-      for (var i = 0; i < cols.length; i++) {
-        final sample = rows.first[cols[i]];
-        final htype = _hostTypeFor(sample);
-        hostTypes.add(htype);
-        final rcBind = db.bcp_bind(
-          dbproc,
-          nullptr,
-          0,
-          -1,
-          nullptr,
-          0,
-          htype,
-          i + 1,
+    return _operation(
+      (db, proc) => using((arena) {
+        _check(
+          'bcp_init',
+          () => db.bcp_init(
+            proc,
+            toNativeFreeTdsText(table, allocator: arena),
+            nullptr,
+            nullptr,
+            DB_IN,
+          ),
         );
-        if (rcBind != SUCCEED) {
-          throw SQLException('bcp_bind failed for column ${i + 1}');
-        }
-      }
-
-      int sent = 0;
-      int total = 0;
-
-      // Row buffers per column allocated per row (freed after send)
-      for (final row in rows) {
-        final allocs = <_TempBuf>[];
-        try {
-          // Set data pointers/lengths for this row
-          for (var i = 0; i < cols.length; i++) {
-            final v = row[cols[i]];
-            if (v == null) {
-              // Indicate NULL
-              db.bcp_collen(dbproc, -1, i + 1);
-              db.bcp_colptr(dbproc, nullptr, i + 1);
-              continue;
-            }
-            final buf = _encodeForHost(hostTypes[i], v);
-            allocs.add(buf);
-            db.bcp_collen(dbproc, buf.length, i + 1);
-            db.bcp_colptr(dbproc, buf.ptr.cast<Uint8>(), i + 1);
-          }
-
-          // Send the row
-          final rcSend = db.bcp_sendrow(dbproc);
-          if (rcSend != SUCCEED) {
-            throw SQLException('bcp_sendrow failed');
-          }
-          sent++;
-
-          // Batch if needed
-          if (batchSize > 0 && (sent % batchSize == 0)) {
-            final b = db.bcp_batch(dbproc);
-            if (b < 0) {
-              throw SQLException('bcp_batch failed');
-            }
-            total += b;
-          }
-        } finally {
-          // Free allocated buffers for this row
-          for (final a in allocs) {
-            malloc.free(a.ptr);
-          }
-        }
-      }
-
-      // Finalize
-      final done = db.bcp_done(dbproc);
-      if (done < 0) {
-        throw SQLException('bcp_done failed');
-      }
-      total += done;
-      return total;
-    } finally {
-      malloc.free(tbl);
-    }
-  }
-
-  /// Execute a plain SQL text command and return a JSON payload.
-  ///
-  /// Returns a JSON String of the form:
-  /// { columns: [..], rows: [ {col:val,..}, ..], affected: (int), error?: (string) }
-  ///
-  /// Logging: emits lines in the form `execute | key=value | ...`.
-  Future<String> execute(String sql) async {
-    _ensureConnected();
-    final db = _db!;
-    final dbproc = _dbproc!;
-    // Detect if we should enable strict SET options for this statement
-    final _SetPlan plan = _analyzeSetNeeds(sql);
-    if (plan.needsSet) {
-      // 1) Enable options in their own batch
-      final setCmd = plan.setPrefix.toNativeUtf8();
-      try {
-        MssqlLogger.i('execute | op=dbcmd | sqlLen=${plan.setPrefix.length}');
-        final rc1 = db.dbcmd(dbproc, setCmd);
-        if (rc1 != SUCCEED) {
-          MssqlLogger.e('execute | op=dbcmd | rc=$rc1 | error=fail');
-          final em =
-              DBLib.takeLastMessage(dbproc) ?? DBLib.takeLastError(dbproc);
-          throw SQLException(em ?? 'dbcmd failed (SET options)');
-        }
-        MssqlLogger.i('execute | op=dbsqlexec');
-        final rc2 = db.dbsqlexec(dbproc);
-        if (rc2 != SUCCEED) {
-          MssqlLogger.e('execute | op=dbsqlexec | rc=$rc2 | error=fail');
-          final em =
-              DBLib.takeLastMessage(dbproc) ?? DBLib.takeLastError(dbproc);
-          throw SQLException(em ?? 'dbsqlexec failed (SET options)');
-        }
-        // Drain results for SET batch
-        _collectResults(db, dbproc);
-      } finally {
-        malloc.free(setCmd);
-      }
-
-      // 2) Execute the original SQL in its own batch (ensuring CREATE VIEW is first)
-      final cmd = sql.toNativeUtf8();
-      try {
-        MssqlLogger.i('execute | op=dbcmd | sqlLen=${sql.length}');
-        final rc1 = db.dbcmd(dbproc, cmd);
-        if (rc1 != SUCCEED) {
-          MssqlLogger.e('execute | op=dbcmd | rc=$rc1 | error=fail');
-          final em =
-              DBLib.takeLastMessage(dbproc) ?? DBLib.takeLastError(dbproc);
-          throw SQLException(em ?? 'dbcmd failed');
-        }
-        MssqlLogger.i('execute | op=dbsqlexec');
-        final rc2 = db.dbsqlexec(dbproc);
-        if (rc2 != SUCCEED) {
-          MssqlLogger.e('execute | op=dbsqlexec | rc=$rc2 | error=fail');
-          final em =
-              DBLib.takeLastMessage(dbproc) ?? DBLib.takeLastError(dbproc);
-          throw SQLException(em ?? 'dbsqlexec failed');
-        }
-        return _collectResults(db, dbproc);
-      } finally {
-        malloc.free(cmd);
-      }
-    } else {
-      // Regular path
-      final cmd = sql.toNativeUtf8();
-      try {
-        MssqlLogger.i('execute | op=dbcmd | sqlLen=${sql.length}');
-        final rc1 = db.dbcmd(dbproc, cmd);
-        if (rc1 != SUCCEED) {
-          MssqlLogger.e('execute | op=dbcmd | rc=$rc1 | error=fail');
-          final em =
-              DBLib.takeLastMessage(dbproc) ?? DBLib.takeLastError(dbproc);
-          throw SQLException(em ?? 'dbcmd failed');
-        }
-        MssqlLogger.i('execute | op=dbsqlexec');
-        final rc2 = db.dbsqlexec(dbproc);
-        if (rc2 != SUCCEED) {
-          MssqlLogger.e('execute | op=dbsqlexec | rc=$rc2 | error=fail');
-          final em =
-              DBLib.takeLastMessage(dbproc) ?? DBLib.takeLastError(dbproc);
-          throw SQLException(em ?? 'dbsqlexec failed');
-        }
-        return _collectResults(db, dbproc);
-      } finally {
-        malloc.free(cmd);
-      }
-    }
-  }
-
-  /// Execute parameterized SQL via DB-Lib RPC to sp_executesql and return JSON.
-  ///
-  /// - [sql]: text with @param placeholders (e.g., SELECT * FROM T WHERE c=@p)
-  /// - [params]: map of parameterName -> value (name can include or omit leading @)
-  ///
-  /// This uses the DB-Lib RPC path:
-  /// 1) dbrpcinit(dbproc, 'sp_executesql', 0)
-  /// 2) dbrpcparam for @stmt (NVARCHAR) and @params (NVARCHAR)
-  /// 3) dbrpcparam for each user parameter (typed, binary-safe)
-  /// 4) dbrpcsend + dbsqlok, then results are collected via [_collectResults].
-  ///
-  /// Benefits: avoids string concatenation and quoting, preserves types, and
-  /// leverages the server to plan/execute with true parameters.
-  ///
-  /// Logging: emits lines in the form `executeParams | key=value | ...`.
-  Future<String> executeParams(String sql, Map<String, dynamic> params) async {
-    _ensureConnected();
-    final db = _db!;
-    final dbproc = _dbproc!;
-
-    // Normalize param names to include '@'
-    final norm = <String, dynamic>{};
-    params.forEach((k, v) => norm[_normalizeParamName(k)] = v);
-    MssqlLogger.i('executeParams | op=normalize | count=${norm.length}');
-
-    // Build parameter declaration string (e.g., "@p1 int, @p2 nvarchar(max)")
-    final decls = <String>[];
-    for (final e in norm.entries) {
-      final declType = _inferSqlType(e.value);
-      decls.add('${e.key} $declType');
-    }
-    final declStr = decls.join(', ');
-
-    // Prepare RPC call: sp_executesql(@stmt, @params, <params...>) with dynamic string encoding
-    final rpcName = 'sp_executesql'.toNativeUtf8();
-    final _StringDbBuf stmtBuf = _encodeStringSmart(sql);
-    final _StringDbBuf paramsBuf = _encodeStringSmart(declStr);
-
-    // We'll pass Utf8 pointers directly; no extra copies
-    final tempAllocations = <_TempBuf>[]; // values for user params
-
-    try {
-      MssqlLogger.i('executeParams | op=dbrpcinit | rpc=sp_executesql');
-      final rcInit = db.dbrpcinit(dbproc, rpcName, 0);
-      if (rcInit != SUCCEED) {
-        MssqlLogger.e('executeParams | op=dbrpcinit | rc=$rcInit | error=fail');
-        // In case previous RPC left state dirty, attempt a reset
-        try {
-          final empty = ''.toNativeUtf8();
-          db.dbrpcinit(dbproc, empty, DBRPCRESET);
-          malloc.free(empty);
-        } catch (_) {}
-        final em = DBLib.takeLastMessage(dbproc) ?? DBLib.takeLastError(dbproc);
-        throw SQLException(em ?? 'dbrpcinit failed');
-      }
-
-      // @stmt (VARCHAR or NVARCHAR based on content)
-      final nameStmt = '@stmt'.toNativeUtf8();
-      final rcP1 = db.dbrpcparam(
-        dbproc,
-        nameStmt,
-        0,
-        stmtBuf.type,
-        -1, // maxlen: -1 for non-OUTPUT
-        // datalen: NVARCHAR expects character count; VARCHAR expects bytes
-        (stmtBuf.type == SYBNVARCHAR)
-            ? (stmtBuf.buf.length >> 1)
-            : stmtBuf.buf.length,
-        stmtBuf.buf.ptr,
-      );
-      malloc.free(nameStmt);
-      if (rcP1 != SUCCEED) {
-        MssqlLogger.e(
-          'executeParams | op=dbrpcparam | name=@stmt | rc=$rcP1 | error=fail',
-        );
-        // Reset RPC state to allow future dbrpcinit calls
-        try {
-          final z = ''.toNativeUtf8();
-          db.dbrpcinit(dbproc, z, DBRPCRESET);
-          malloc.free(z);
-        } catch (_) {}
-        final em = DBLib.takeLastMessage(dbproc) ?? DBLib.takeLastError(dbproc);
-        throw SQLException(em ?? 'dbrpcparam @stmt failed');
-      }
-
-      // @params (can be empty) as VARCHAR or NVARCHAR based on content
-      final nameParams = '@params'.toNativeUtf8();
-      final rcP2 = db.dbrpcparam(
-        dbproc,
-        nameParams,
-        0,
-        paramsBuf.type,
-        -1, // maxlen: -1 for non-OUTPUT
-        // datalen: NVARCHAR expects character count; VARCHAR expects bytes
-        (paramsBuf.type == SYBNVARCHAR)
-            ? (paramsBuf.buf.length >> 1)
-            : paramsBuf.buf.length,
-        paramsBuf.buf.ptr,
-      );
-      malloc.free(nameParams);
-      if (rcP2 != SUCCEED) {
-        MssqlLogger.e(
-          'executeParams | op=dbrpcparam | name=@params | rc=$rcP2 | error=fail',
-        );
-        try {
-          final z = ''.toNativeUtf8();
-          db.dbrpcinit(dbproc, z, DBRPCRESET);
-          malloc.free(z);
-        } catch (_) {}
-        final em = DBLib.takeLastMessage(dbproc) ?? DBLib.takeLastError(dbproc);
-        throw SQLException(em ?? 'dbrpcparam @params failed');
-      }
-
-      // User parameters: add in the same order as declarations
-      for (final e in norm.entries) {
-        final name = e.key; // includes @
-        final value = e.value;
-        final rpcVal = _encodeForRpc(value);
-        tempAllocations.add(rpcVal.buf);
-        final cname = name.toNativeUtf8();
-        final rcPi = db.dbrpcparam(
-          dbproc,
-          cname,
-          0, // input param
-          rpcVal.type,
-          -1, // maxlen: -1 for non-OUTPUT
-          (rpcVal.type == SYBNVARCHAR)
-              ? (rpcVal.buf.length << 1)
-              : rpcVal
-                    .buf
-                    .length, // datalen: for NVARCHAR pass character count; for others, bytes
-          rpcVal.buf.ptr,
-        );
-        malloc.free(cname);
-        if (rcPi != SUCCEED) {
-          MssqlLogger.e(
-            'executeParams | op=dbrpcparam | name=$name | rc=$rcPi | error=fail',
+        for (var i = 0; i < cols.length; i++) {
+          _check(
+            'bcp_bind',
+            () =>
+                db.bcp_bind(proc, nullptr, 0, -1, nullptr, 0, types[i]!, i + 1),
           );
-          try {
-            final z = ''.toNativeUtf8();
-            db.dbrpcinit(dbproc, z, DBRPCRESET);
-            malloc.free(z);
-          } catch (_) {}
-          final em =
-              DBLib.takeLastMessage(dbproc) ?? DBLib.takeLastError(dbproc);
-          throw SQLException(em ?? 'dbrpcparam failed');
         }
-      }
-
-      MssqlLogger.i('executeParams | op=dbrpcsend');
-      final rcSend = db.dbrpcsend(dbproc);
-      if (rcSend != SUCCEED) {
-        MssqlLogger.e('executeParams | op=dbrpcsend | rc=$rcSend | error=fail');
-        final em = DBLib.takeLastMessage(dbproc) ?? DBLib.takeLastError(dbproc);
-        throw SQLException(em ?? 'dbrpcsend failed');
-      }
-
-      MssqlLogger.i('executeParams | op=dbsqlok');
-      final rcOk = db.dbsqlok(dbproc);
-      if (rcOk != SUCCEED) {
-        MssqlLogger.e('executeParams | op=dbsqlok | rc=$rcOk | error=fail');
-        final em = DBLib.takeLastMessage(dbproc) ?? DBLib.takeLastError(dbproc);
-        throw SQLException(em ?? 'dbsqlok failed');
-      }
-
-      // Read results via shared collector
-      return _collectResults(db, dbproc);
-    } finally {
-      // Free buffers for @stmt/@params and user param values
-      malloc.free(stmtBuf.buf.ptr);
-      malloc.free(paramsBuf.buf.ptr);
-      for (final t in tempAllocations) {
-        malloc.free(t.ptr);
-      }
-      malloc.free(rpcName);
-    }
-  }
-  // --- Internals ---
-
-  /// Collect rows and counts from the DB-Lib results pipeline.
-  ///
-  /// Behavior and design:
-  /// - Iterates dbresults() until NO_MORE_RESULTS.
-  /// - Captures column metadata from the first result set with columns only;
-  ///   subsequent row-bearing result sets are ignored to keep the return shape
-  ///   stable (single columns + rows list). Row counts from all sets are
-  ///   aggregated via dbcount().
-  /// - Decodes each value using decodeDbValueWithFallback() for safety.
-  ///
-  /// Logging: emits standardized lines prefixed with `collectResults`.
-  ///
-  /// Returns JSON: { columns: [...], rows: [...], affected: (int), error?: (string) }
-  String _collectResults(DBLib db, Pointer<DBPROCESS> dbproc) {
-    final rows = <Map<String, dynamic>>[];
-    final columns = <String>[];
-    int affectedTotal = 0;
-    bool capturedFirstSet = false;
-    String? error;
-
-    MssqlLogger.i('collectResults | op=start');
-    int setIndex = 0;
-    while (true) {
-      final r = db.dbresults(dbproc);
-      if (r == NO_MORE_RESULTS) {
-        MssqlLogger.i('collectResults | op=dbresults | result=$r | status=end');
-        break;
-      }
-      if (r != SUCCEED) {
-        error = 'dbresults failed (rc=$r)';
-        MssqlLogger.e('collectResults | op=dbresults | rc=$r | error=fail');
-        break;
-      }
-      setIndex++;
-      final ncols = db.dbnumcols(dbproc);
-      MssqlLogger.i('collectResults | op=set | index=$setIndex | ncols=$ncols');
-      final types = List<int>.filled(ncols, 0);
-      // Cache column names and types for efficiency
-      if (ncols > 0 && !capturedFirstSet) {
-        for (var i = 1; i <= ncols; i++) {
-          final cptr = db.dbcolname(dbproc, i);
-          types[i - 1] = db.dbcoltype(dbproc, i);
-          final name = cptr == nullptr ? 'col$i' : cptr.toDartString();
-          columns.add(name);
-        }
-        capturedFirstSet = true;
-        MssqlLogger.i('collectResults | op=columns | count=${columns.length}');
-      }
-
-      // Fetch rows only for the first schema-bearing result set
-      int fetched = 0;
-      if (ncols > 0 && capturedFirstSet && columns.isNotEmpty) {
-        while (true) {
-          final nr = db.dbnextrow(dbproc);
-          if (nr == NO_MORE_ROWS) break;
-          if (nr != REG_ROW && nr != MORE_ROWS) {
-            MssqlLogger.w(
-              'collectResults | op=dbnextrow | rc=$nr | warning=unexpected',
+        var sent = 0, copied = 0;
+        for (final row in rows) {
+          using((rowArena) {
+            for (var i = 0; i < cols.length; i++) {
+              final v = _encodeForRpc(row[cols[i]], rowArena, type: types[i]);
+              _check('bcp_collen', () => db.bcp_collen(proc, v.length, i + 1));
+              _check('bcp_colptr', () => db.bcp_colptr(proc, v.ptr, i + 1));
+            }
+            _check('bcp_sendrow', () => db.bcp_sendrow(proc));
+          });
+          if (++sent % batchSize == 0) {
+            copied += _checked(
+              'bcp_batch',
+              () => db.bcp_batch(proc),
+              (n) => n >= 0,
             );
+          }
+        }
+        copied += _checked('bcp_done', () => db.bcp_done(proc), (n) => n >= 0);
+        return copied;
+      }),
+    );
+  }
+}
+
+(String, Map<String, dynamic>) _bindPositional(String sql, List values) {
+  var prefix = '@__cursor';
+  final lower = sql.toLowerCase();
+  while (lower.contains(prefix)) {
+    prefix += '_';
+  }
+  final output = StringBuffer();
+  final parameters = <String, dynamic>{};
+  var i = 0;
+  while (i < sql.length) {
+    final ch = sql[i];
+    if (ch == "'" || ch == '"' || ch == '[') {
+      final end = ch == '[' ? ']' : ch;
+      output.write(ch);
+      i++;
+      while (i < sql.length) {
+        final quoted = sql[i++];
+        output.write(quoted);
+        if (quoted == end) {
+          if (i < sql.length && sql[i] == end) {
+            output.write(sql[i++]);
+          } else {
             break;
           }
-          final row = <String, dynamic>{};
-          for (var i = 1; i <= ncols; i++) {
-            final name = i <= columns.length ? columns[i - 1] : 'col$i';
-            final t = types[i - 1];
-            final len = db.dbdatlen(dbproc, i);
-            final ptr = db.dbdata(dbproc, i);
-            final v = decodeDbValueWithFallback(db, dbproc, t, ptr, len);
-            row[name] = v;
-          }
-          rows.add(row);
-          fetched++;
-        }
-        MssqlLogger.i(
-          'collectResults | op=rows | set=$setIndex | fetched=$fetched',
-        );
-      } else if (ncols > 0) {
-        // If this is a second schema-bearing set, skip its rows for shape stability
-        MssqlLogger.w(
-          'collectResults | op=skip-rows | set=$setIndex | reason=secondary-schema',
-        );
-        // Drain rows without collecting
-        while (true) {
-          final nr = db.dbnextrow(dbproc);
-          if (nr == NO_MORE_ROWS) break;
-          if (nr != REG_ROW && nr != MORE_ROWS) break;
         }
       }
-
-      // Accumulate affected rows for this set
-      try {
-        final c = db.dbcount(dbproc);
-        affectedTotal += c;
-        MssqlLogger.i(
-          'collectResults | op=dbcount | set=$setIndex | value=$c | total=$affectedTotal',
-        );
-      } catch (e) {
-        MssqlLogger.w('collectResults | op=dbcount | set=$setIndex | error=$e');
+    } else if (sql.startsWith('--', i)) {
+      while (i < sql.length && sql[i] != '\n' && sql[i] != '\r') {
+        output.write(sql[i++]);
       }
-    }
-
-    final result = <String, dynamic>{
-      'columns': columns,
-      'rows': rows,
-      'affected': affectedTotal,
-    };
-    if (error != null) result['error'] = error;
-    MssqlLogger.i(
-      'collectResults | status=done | rows=${rows.length} | affected=$affectedTotal',
-    );
-    return jsonEncode(result);
-  }
-
-  void _ensureConnected() {
-    if (!_connected || _dbproc == null || _dbproc == nullptr) {
-      throw SQLException('Not connected. Call connect() first.');
-    }
-  }
-
-  static String _normalizeParamName(String name) =>
-      name.startsWith('@') ? name : '@$name';
-
-  static String _inferSqlType(dynamic v) {
-    // For NULL values, avoid sql_variant which cannot implicitly convert to many types.
-    // Use NVARCHAR(MAX) so NULL can bind safely to any nullable target type.
-    if (v == null) return 'nvarchar(max)';
-    if (v is bool) return 'bit';
-    if (v is int) {
-      // choose bigint if outside 32-bit range
-      if (v < -2147483648 || v > 2147483647) return 'bigint';
-      return 'int';
-    }
-    if (v is double) return 'float';
-    if (v is String) return 'nvarchar(max)';
-    // Declare DateTime parameters as NVARCHAR and let SQL convert explicitly
-    // (e.g., CONVERT(datetime2, @when)). This avoids binary TDS packing.
-    if (v is DateTime) return 'nvarchar(50)';
-    if (v is Uint8List) return 'varbinary(max)';
-    // Fallback to NVARCHAR
-    return 'nvarchar(max)';
-  }
-
-  // Analyze whether strict SET options are needed and generate the SET batch.
-  _SetPlan _analyzeSetNeeds(String sql) {
-    final trimmed = sql.trimLeft();
-    if (trimmed.isEmpty) return const _SetPlan(false, '');
-    final up = trimmed.toUpperCase();
-    final isDdl =
-        up.startsWith('CREATE ') ||
-        up.startsWith('ALTER ') ||
-        up.startsWith('DROP ');
-    final targetsStrict =
-        up.startsWith('CREATE VIEW ') ||
-        up.startsWith('ALTER VIEW ') ||
-        up.startsWith('CREATE TABLE ') ||
-        up.startsWith('ALTER TABLE ') ||
-        up.startsWith('CREATE INDEX ') ||
-        up.startsWith('ALTER INDEX ') ||
-        up.startsWith('CREATE FUNCTION ') ||
-        up.startsWith('ALTER FUNCTION ') ||
-        up.startsWith('CREATE PROCEDURE ') ||
-        up.startsWith('ALTER PROCEDURE ') ||
-        up.startsWith('CREATE TRIGGER ') ||
-        up.startsWith('ALTER TRIGGER ');
-    if (!(isDdl || targetsStrict)) return const _SetPlan(false, '');
-    const setPrefix =
-        'SET ANSI_NULLS ON; '
-        'SET QUOTED_IDENTIFIER ON; '
-        'SET ANSI_PADDING ON; '
-        'SET ANSI_WARNINGS ON; '
-        'SET CONCAT_NULL_YIELDS_NULL ON; '
-        'SET ARITHABORT ON; '
-        'SET NUMERIC_ROUNDABORT OFF;';
-    return const _SetPlan(true, setPrefix);
-  }
-}
-
-class _SetPlan {
-  final bool needsSet;
-  final String setPrefix;
-  const _SetPlan(this.needsSet, this.setPrefix);
-}
-
-class _TempBuf {
-  final Pointer<Uint8> ptr;
-  final int length;
-  _TempBuf(this.ptr, this.length);
-}
-
-class _RpcVal {
-  final int type; // DB-Lib type code for dbrpcparam
-  final _TempBuf buf;
-  _RpcVal(this.type, this.buf);
-}
-
-int _hostTypeFor(dynamic v) {
-  if (v is int) {
-    if (v < -2147483648 || v > 2147483647) return SYBINT8;
-    return SYBINT4;
-  }
-  if (v is double) return SYBFLT8;
-  if (v is bool) return SYBBIT;
-  if (v is Uint8List) return SYBVARBINARY;
-  // Default to NVARCHAR for textual data to preserve Unicode and align with SQL Server
-  return SYBNVARCHAR;
-}
-
-_TempBuf _encodeForHost(int hostType, dynamic v) {
-  switch (hostType) {
-    case SYBINT4:
-      {
-        final p = malloc<Int32>();
-        p.value = (v as int);
-        return _TempBuf(p.cast<Uint8>(), 4);
-      }
-    case SYBINT8:
-      {
-        final p = malloc<Int64>();
-        p.value = (v as int);
-        return _TempBuf(p.cast<Uint8>(), 8);
-      }
-    case SYBFLT8:
-      {
-        final p = malloc<Double>();
-        p.value = (v as double);
-        return _TempBuf(p.cast<Uint8>(), 8);
-      }
-    case SYBBIT:
-      {
-        final p = malloc<Uint8>();
-        p.value = (v as bool) ? 1 : 0;
-        return _TempBuf(p.cast<Uint8>(), 1);
-      }
-    case SYBVARBINARY:
-      {
-        final bytes = (v as Uint8List);
-        final p = malloc<Uint8>(bytes.length);
-        p.asTypedList(bytes.length).setAll(0, bytes);
-        return _TempBuf(p, bytes.length);
-      }
-    case SYBVARCHAR:
-    default:
-      {
-        // Encode as UTF-16LE for NVARCHAR host type; if type is actually SYBVARCHAR, SQL Server will convert.
-        final s = (v is String)
-            ? v
-            : (v is DateTime)
-            ? v.toIso8601String()
-            : v.toString();
-        final codeUnits = s.codeUnits;
-        // Each code unit to 2 bytes LE
-        final len = codeUnits.length * 2;
-        final p = malloc<Uint8>(len);
-        final view = p.asTypedList(len);
-        for (int i = 0, j = 0; i < codeUnits.length; i++, j += 2) {
-          final cu = codeUnits[i];
-          view[j] = cu & 0xFF;
-          view[j + 1] = (cu >> 8) & 0xFF;
+    } else if (sql.startsWith('/*', i)) {
+      var depth = 1;
+      output.write('/*');
+      i += 2;
+      while (i < sql.length && depth > 0) {
+        if (sql.startsWith('/*', i)) {
+          depth++;
+          output.write('/*');
+          i += 2;
+        } else if (sql.startsWith('*/', i)) {
+          depth--;
+          output.write('*/');
+          i += 2;
+        } else {
+          output.write(sql[i++]);
         }
-        return _TempBuf(p, len);
       }
-  }
-}
-
-// Map a Dart value to a DB-Lib type code and native buffer suitable for dbrpcparam.
-// For safety and simplicity, most complex types are passed as NVARCHAR and
-// converted server-side according to the declared SQL type in sp_executesql.
-_RpcVal _encodeForRpc(dynamic v) {
-  if (v == null) {
-    // Represent NULL by zero-length buffer of any type; server will see NULL
-    // when dbrpcparam datalen is 0.
-    final p = malloc<Uint8>(0);
-    return _RpcVal(SYBNVARCHAR, _TempBuf(p, 0));
-  }
-  if (v is bool) {
-    final p = malloc<Uint8>();
-    p.value = v ? 1 : 0;
-    return _RpcVal(SYBBIT, _TempBuf(p, 1));
-  }
-  if (v is int) {
-    if (v < -2147483648 || v > 2147483647) {
-      final p = malloc<Int64>();
-      p.value = v;
-      return _RpcVal(SYBINT8, _TempBuf(p.cast<Uint8>(), 8));
+    } else if (ch == '?') {
+      final index = parameters.length;
+      if (index >= values.length) throw ArgumentError('Too few SQL parameters');
+      final name = '${prefix}_$index';
+      parameters[name] = values[index];
+      output.write(name);
+      i++;
     } else {
-      final p = malloc<Int32>();
-      p.value = v;
-      return _RpcVal(SYBINT4, _TempBuf(p.cast<Uint8>(), 4));
+      output.write(ch);
+      i++;
     }
   }
-  if (v is double) {
-    final p = malloc<Double>();
-    p.value = v;
-    return _RpcVal(SYBFLT8, _TempBuf(p.cast<Uint8>(), 8));
+  if (parameters.length != values.length) {
+    throw ArgumentError('Too many SQL parameters');
   }
-  if (v is Uint8List) {
-    final p = malloc<Uint8>(v.length);
-    p.asTypedList(v.length).setAll(0, v);
-    return _RpcVal(SYBVARBINARY, _TempBuf(p, v.length));
-  }
-  // Strings, DateTime, and other objects -> choose VARCHAR/UTF-16 NVARCHAR based on content
-  if (v is String) {
-    final sb = _encodeStringSmart(v);
-    return _RpcVal(sb.type, sb.buf);
-  }
-  if (v is DateTime) {
-    final s = _formatDateTimeForSql(v); // ASCII only
-    final bytes = utf8.encode(s);
-    final p = malloc<Uint8>(bytes.length);
-    p.asTypedList(bytes.length).setAll(0, bytes);
-    return _RpcVal(SYBVARCHAR, _TempBuf(p, bytes.length));
-  }
-  final s = v.toString();
-  final sb = _encodeStringSmart(s);
-  return _RpcVal(sb.type, sb.buf);
+  return (output.toString(), parameters);
 }
 
-// Format DateTime in an ISO-like pattern accepted by SQL Server, without 'Z'.
-// Example: 2025-08-28T02:34:56
-String _formatDateTimeForSql(DateTime dt) {
-  final d = dt.toUtc();
-  String two(int n) => n < 10 ? '0$n' : '$n';
-  return '${d.year.toString().padLeft(4, '0')}-${two(d.month)}-${two(d.day)}T${two(d.hour)}:${two(d.minute)}:${two(d.second)}';
+(String, int)? _splitHostPort(String server) {
+  final colon = server.lastIndexOf(':');
+  if (colon <= 0) return null;
+  final port = int.tryParse(server.substring(colon + 1));
+  if (port == null || port < 1 || port > 65535) return null;
+  var host = server.substring(0, colon);
+  if (host.startsWith('[') && host.endsWith(']')) {
+    host = host.substring(1, host.length - 1);
+  }
+  return (host, port);
 }
 
-class _StringDbBuf {
-  final int type; // SYBVARCHAR or SYBNVARCHAR
-  final _TempBuf buf;
-  _StringDbBuf(this.type, this.buf);
+String quoteSqlIdentifier(String value) {
+  if (value.isEmpty || value.length > 128 || value.contains('\u0000')) {
+    throw ArgumentError('Invalid SQL identifier');
+  }
+  return '[${value.replaceAll(']', ']]')}]';
 }
 
-// Encode a Dart string as either UTF-8 (VARCHAR) if ASCII-only, or UTF-16LE (NVARCHAR) if it contains non-ASCII.
-_StringDbBuf _encodeStringSmart(String s) {
-  bool ascii = true;
-  final units = s.codeUnits;
-  for (final cu in units) {
-    if (cu > 0x7F) {
-      ascii = false;
-      break;
+/// Parse regular or bracket-quoted multipart identifiers, never SQL expressions.
+String quoteSqlName(String value) {
+  final parts = <String>[];
+  var i = 0;
+  while (i < value.length) {
+    while (i < value.length && value[i].trim().isEmpty) {
+      i++;
+    }
+    final part = StringBuffer();
+    if (i < value.length && value[i] == '[') {
+      i++;
+      var closed = false;
+      while (i < value.length) {
+        final ch = value[i++];
+        if (ch == ']') {
+          if (i < value.length && value[i] == ']') {
+            part.write(']');
+            i++;
+          } else {
+            closed = true;
+            break;
+          }
+        } else {
+          part.write(ch);
+        }
+      }
+      if (!closed) throw ArgumentError('Unclosed SQL identifier');
+    } else {
+      final start = i;
+      while (i < value.length && value[i] != '.') {
+        i++;
+      }
+      final raw = value.substring(start, i).trim();
+      if (!RegExp(
+        r'^[\p{L}_#][\p{L}\p{N}_@$#]*$',
+        unicode: true,
+      ).hasMatch(raw)) {
+        throw ArgumentError('Invalid SQL identifier');
+      }
+      part.write(raw);
+    }
+    parts.add(quoteSqlIdentifier(part.toString()));
+    while (i < value.length && value[i].trim().isEmpty) {
+      i++;
+    }
+    if (i == value.length) break;
+    if (value[i++] != '.' || i == value.length) {
+      throw ArgumentError('Invalid SQL name');
     }
   }
-  if (ascii) {
-    final bytes = utf8.encode(s);
-    final p = malloc<Uint8>(bytes.length);
-    p.asTypedList(bytes.length).setAll(0, bytes);
-    return _StringDbBuf(SYBVARCHAR, _TempBuf(p, bytes.length));
+  if (parts.isEmpty || parts.length > 4) {
+    throw ArgumentError('Invalid SQL name');
   }
-  // UTF-16LE encode
-  final len = units.length * 2;
-  final p = malloc<Uint8>(len);
-  final view = p.asTypedList(len);
-  for (int i = 0, j = 0; i < units.length; i++, j += 2) {
-    final cu = units[i];
-    view[j] = cu & 0xFF;
-    view[j + 1] = (cu >> 8) & 0xFF;
+  return parts.join('.');
+}
+
+Map<String, dynamic> _normalizeParams(
+  Map<String, dynamic> params, {
+  int limit = 2100,
+}) {
+  final result = <String, dynamic>{};
+  final seen = <String>{};
+  for (final entry in params.entries) {
+    final name = entry.key.startsWith('@') ? entry.key : '@${entry.key}';
+    if (name.length > 128 ||
+        !RegExp(r'^@[\p{L}_][\p{L}\p{N}_]*$', unicode: true).hasMatch(name)) {
+      throw ArgumentError('Invalid SQL parameter name');
+    }
+    if (!seen.add(name.toLowerCase())) {
+      throw ArgumentError('Duplicate SQL parameter');
+    }
+    result[name] = entry.value;
   }
-  return _StringDbBuf(SYBNVARCHAR, _TempBuf(p, len));
+  if (result.length > limit) {
+    throw ArgumentError('SQL Server parameter limit exceeded');
+  }
+  return result;
+}
+
+String _inferSqlType(dynamic v) {
+  if (v is bool) return 'bit';
+  if (v is int) return v < -2147483648 || v > 2147483647 ? 'bigint' : 'int';
+  if (v is double) return 'float';
+  if (v is DateTime) return 'datetimeoffset(7)';
+  if (v is Uint8List) return 'varbinary(max)';
+  return 'nvarchar(max)';
+}
+
+int? _bulkType(Iterable<dynamic> values) {
+  if (values.every((v) => v is int)) {
+    return values.any((v) => v < -2147483648 || v > 2147483647)
+        ? SYBINT8
+        : SYBINT4;
+  }
+  if (values.every((v) => v is double && v.isFinite)) return SYBFLT8;
+  if (values.every((v) => v is bool)) return SYBBIT;
+  if (values.every((v) => v is Uint8List && v.isNotEmpty)) return SYBVARBINARY;
+  return null;
+}
+
+class _RpcValue {
+  final int type, length;
+  final Pointer<Uint8> ptr;
+  _RpcValue(this.type, this.ptr, this.length);
+}
+
+_RpcValue _encodeForRpc(dynamic value, Allocator arena, {int? type}) {
+  if (value == null) return _RpcValue(SYBNTEXT, nullptr, 0);
+  if (value is int) {
+    if (type == SYBINT8 || value < -2147483648 || value > 2147483647) {
+      final p = arena<Int64>()..value = value;
+      return _RpcValue(SYBINT8, p.cast(), 8);
+    }
+    final p = arena<Int32>()..value = value;
+    return _RpcValue(SYBINT4, p.cast(), 4);
+  }
+  if (value is double) {
+    if (!value.isFinite) throw ArgumentError('SQL float must be finite');
+    final p = arena<Double>()..value = value;
+    return _RpcValue(SYBFLT8, p.cast(), 8);
+  }
+  if (value is bool) {
+    final p = arena<Uint8>()..value = value ? 1 : 0;
+    return _RpcValue(SYBBIT, p, 1);
+  }
+  if (value is DateTime) {
+    final utc = value.toUtc();
+    if (utc.year < 1 ||
+        utc.year > 9999 ||
+        value.timeZoneOffset.inMinutes.abs() > 840) {
+      throw ArgumentError('DateTime outside SQL Server datetimeoffset range');
+    }
+    final p = arena<Uint8>(16);
+    p.asTypedList(16).fillRange(0, 16, 0);
+    final bytes = ByteData.sublistView(p.asTypedList(16));
+    final midnight = DateTime.utc(utc.year, utc.month, utc.day);
+    bytes.setUint64(
+      0,
+      utc.difference(midnight).inMicroseconds * 10,
+      Endian.host,
+    );
+    bytes.setInt32(
+      8,
+      midnight.difference(DateTime.utc(1900, 1, 1)).inDays,
+      Endian.host,
+    );
+    bytes.setInt16(12, value.timeZoneOffset.inMinutes, Endian.host);
+    bytes.setUint16(14, 7 | (1 << 13) | (1 << 14) | (1 << 15), Endian.host);
+    return _RpcValue(SYBMSDATETIMEOFFSET, p, 16);
+  }
+  final bytes = value is Uint8List
+      ? value
+      : freeTdsTextCodec.encode(value.toString());
+  final p = arena<Uint8>(bytes.isEmpty ? 1 : bytes.length);
+  p.asTypedList(bytes.length).setAll(0, bytes);
+  return _RpcValue(
+    // FreeTDS caps ordinary VARBINARY at 8000 bytes. IMAGE is promoted to
+    // VARBINARY(MAX) on TDS 7.2+, preserving larger RPC inputs.
+    value is Uint8List
+        ? (bytes.length > 8000 ? SYBIMAGE : SYBVARBINARY)
+        : SYBNTEXT,
+    p,
+    bytes.length,
+  );
 }

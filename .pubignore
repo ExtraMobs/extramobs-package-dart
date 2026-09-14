@@ -1,0 +1,11 @@
+todo/
+.dart_tool/
+pubspec.lock
+.fvm/
+.env
+.env.*
+!.env.example
+build/
+out-*/
+__pycache__/
+recuperacao_ceo_trechos.json

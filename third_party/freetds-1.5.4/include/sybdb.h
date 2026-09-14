@@ -762,6 +762,9 @@ DBBOOL dbdead(DBPROCESS * dbproc);
 
 #define DBDEAD(x) dbdead((x))
 EHANDLEFUNC dberrhandle(EHANDLEFUNC handler);
+/* sql_server_wrapper: one callback-owning isolate per process. */
+RETCODE sql_server_wrapper_init(EHANDLEFUNC error_handler, MHANDLEFUNC message_handler);
+int sql_server_wrapper_peer_certificate(DBPROCESS *dbproc, unsigned char *buffer, int capacity);
 void dbexit(void);
 RETCODE dbfcmd(DBPROCESS * dbproc, const char *fmt, ...);
 DBINT dbfirstrow(DBPROCESS * dbproc);
@@ -1302,6 +1305,9 @@ RETCODE dbsetlversion (LOGINREC * login, BYTE version);
 #define DBSETDELEGATION		1004
 #define DBSETLDELEGATION(x, y)	dbsetlbool((x), (y), DBSETDELEGATION)
 #define DBSETENCRYPTION		1005
+#define DBSETCAFILE              20001 /* sql_server_wrapper: explicit CA trust, empty disables validation */
+#define DBSETCERTIFICATEHOSTNAME 20002 /* sql_server_wrapper: expected identity */
+#define DBRPCEMPTY               0x80  /* sql_server_wrapper: non-NULL zero bytes */
 #define DBSETLENCRYPTION(x, y)  dbsetlname((x), (y), DBSETENCRYPTION)
 #define DBSETPORT 		1006
 #define DBSETLPORT(x,y) 	dbsetlshort((x), (y), DBSETPORT)

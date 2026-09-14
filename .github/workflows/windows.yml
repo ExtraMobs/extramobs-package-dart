@@ -1,0 +1,21 @@
+name: Windows validation
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - run: flutter pub get
+      - run: flutter analyze
+      - run: dart test test/freetds_text_test.dart
+      - run: dart test test/native_library_test.dart
+      - working-directory: example
+        run: flutter build windows --release

@@ -53,7 +53,7 @@ void main() {
         final rows = parseRows(
           await harness.query('SELECT * FROM dbo.SimpleItems WHERE id = 2'),
         );
-        expect(rows.first['value'], 99.50);
+        expect(rows.first['value'], '99.50');
         expect(rows.first['is_active'], true);
       });
 
@@ -83,7 +83,7 @@ void main() {
         final rows = parseRows(
           await harness.query('SELECT value FROM dbo.SimpleItems WHERE id = 4'),
         );
-        expect(rows.first['value'], 15.5);
+        expect(rows.first['value'], '15.50');
       });
 
       test('F_EASY_005: DELETE single record', () async {
@@ -130,7 +130,7 @@ void main() {
             'SELECT SUM(value) as total FROM dbo.SimpleItems WHERE id IN (20, 21)',
           ),
         );
-        expect(rows.first['total'], 26.0);
+        expect(rows.first['total'], '26.00');
       });
 
       test('F_EASY_008: ORDER BY ascending', () async {
@@ -210,7 +210,7 @@ void main() {
             );
             expect(rows.length, 1);
             expect(rows.first['name'], 'Bulk Test Item $i');
-            expect(rows.first['value'], i * 2.5);
+            expect(rows.first['value'], (i * 2.5).toStringAsFixed(2));
             expect(rows.first['is_active'], i % 2 == 0);
 
             // Update the record
@@ -225,7 +225,7 @@ void main() {
                 'SELECT value FROM dbo.SimpleItems WHERE id = $testId',
               ),
             );
-            expect(updatedRows.first['value'], i * 3.0);
+            expect(updatedRows.first['value'], (i * 3.0).toStringAsFixed(2));
           },
         );
       }
@@ -315,7 +315,7 @@ void main() {
 
         expect(rows.length, 1);
         expect(rows.first['name'], 'John Doe');
-        expect(rows.first['total_amount'], 999.99);
+        expect(rows.first['total_amount'], '999.99');
       });
 
       test('F_MOD_002: INNER JOIN with parameterized WHERE', () async {
@@ -681,7 +681,7 @@ void main() {
 
         expect(rows.length, 5);
         expect(rows.first['price_rank'], 1);
-        expect(rows.first['price'], 1000.0); // Product 5 has highest price
+        expect(rows.first['price'], '1000.0000'); // Product 5 has highest price
       });
 
       test('F_HARD_004: Common Table Expression (CTE) with recursion', () async {
@@ -836,7 +836,7 @@ void main() {
             expect(rows.length, 1);
             expect(rows.first['category_name'], 'Category_$i');
             expect(rows.first['product_name'], 'Product_$i');
-            expect(rows.first['margin'] > 0, true);
+            expect(rows.first['margin'], '${i * 40 + 40}.0000');
           },
         );
       }
@@ -1091,7 +1091,7 @@ void main() {
             'SELECT price FROM dbo.Products WHERE product_id = 1',
           ),
         );
-        expect(productRows.first['price'], 150.0);
+        expect(productRows.first['price'], '150.0000');
 
         // Verify audit trail
         final auditRows = parseRows(
@@ -1128,16 +1128,14 @@ void main() {
               ),
             );
 
-            final discount = rows.first['discount'] as double;
-            expect(discount >= 0, true);
-            expect(discount <= 15.0, true);
+            final discount = rows.first['discount'];
 
             if (amount >= 10000) {
-              expect(discount, 15.0);
+              expect(discount, '15.00');
             } else if (amount >= 5000) {
-              expect(discount, 10.0);
+              expect(discount, '10.00');
             } else {
-              expect(discount, 5.0);
+              expect(discount, '5.00');
             }
           }
         },
@@ -1208,7 +1206,7 @@ void main() {
         expect(rows.length, 1);
         expect(rows.first['total_quantity_sold'], 5);
         expect(rows.first['sale_count'], 1);
-        expect(rows.first['total_revenue'], 675.0); // 5 * 150 * 0.9
+        expect(rows.first['total_revenue'], '675.0000000000'); // 5 * 150 * 0.9
       });
 
       test(
@@ -1364,7 +1362,7 @@ void main() {
           expect(rows.length, 1);
           expect(rows.first['company_name'], 'Premium Supplier Inc.');
           expect(rows.first['is_preferred'], true);
-          expect(rows.first['markup'], 70.0); // 150 - 80
+          expect(rows.first['markup'], '70.0000'); // 150 - 80
         },
       );
 
@@ -1538,8 +1536,8 @@ void main() {
             if (i % 2 == 0) {
               expect(rows.length, 1);
               expect(rows.first['product_name'], 'Enterprise_Product_$i');
-              expect(rows.first['gross_margin'] > 0, true);
-              expect(rows.first['margin_percent'] is double, true);
+              expect(rows.first['gross_margin'], '${i * 60 + 100}.0000');
+              expect(rows.first['margin_percent'], isA<String>());
               expect(
                 [
                   'LOW_STOCK',

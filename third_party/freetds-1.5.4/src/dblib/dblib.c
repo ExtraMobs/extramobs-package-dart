@@ -196,6 +196,45 @@ DBLIBCONTEXT;
 static DBLIBCONTEXT g_dblib_ctx;
 static tds_mutex dblib_mutex = TDS_MUTEX_INITIALIZER;
 
+static tds_mutex wrapper_mutex = TDS_MUTEX_INITIALIZER;
+static EHANDLEFUNC wrapper_error_handler;
+static MHANDLEFUNC wrapper_message_handler;
+
+RETCODE
+sql_server_wrapper_init(EHANDLEFUNC error_handler, MHANDLEFUNC message_handler)
+{
+	RETCODE rc = FAIL;
+	if (!error_handler || !message_handler) return FAIL;
+	tds_mutex_lock(&wrapper_mutex);
+	if (wrapper_error_handler) {
+		rc = (wrapper_error_handler == error_handler &&
+		      wrapper_message_handler == message_handler) ? SUCCEED : FAIL;
+	} else if (dbinit() == SUCCEED) {
+		wrapper_error_handler = error_handler;
+		wrapper_message_handler = message_handler;
+		dberrhandle(error_handler);
+		dbmsghandle(message_handler);
+		rc = SUCCEED;
+	}
+	tds_mutex_unlock(&wrapper_mutex);
+	return rc;
+}
+
+/* Copy the peer's DER certificate without exposing TLS-library pointers.
+ * A NULL buffer queries the size; zero means no certificate was received. */
+int
+sql_server_wrapper_peer_certificate(DBPROCESS *dbproc, unsigned char *buffer, int capacity)
+{
+	TDSCONNECTION *conn;
+	if (!dbproc || !dbproc->tds_socket || capacity < 0) return -1;
+	conn = dbproc->tds_socket->conn;
+	if (!buffer) return conn->peer_certificate_der_len;
+	if (capacity < conn->peer_certificate_der_len) return -1;
+	if (conn->peer_certificate_der_len)
+		memcpy(buffer, conn->peer_certificate_der, conn->peer_certificate_der_len);
+	return conn->peer_certificate_der_len;
+}
+
 static int g_dblib_version =
 #if TDS50
 	DBVERSION_100;
@@ -770,14 +809,15 @@ dbsetlname(LOGINREC * login, const char *value, int which)
 	bool copy_ret;
 	const char *value_nonull = value ? value : "";
 
-	tdsdump_log(TDS_DBG_FUNC, "dbsetlname(%p, %s, %d)\n", login, value, which);
+	/* Login fields can contain credentials. Never dump their values. */
+	tdsdump_log(TDS_DBG_FUNC, "dbsetlname(%p, [redacted], %d)\n", login, which);
 
 	if (login == NULL) {
 		dbperror(NULL, SYBEASNL, 0);
 		return FAIL;
 	}
 
-	if (TDS_MAX_LOGIN_STR_SZ < strlen(value_nonull)) {
+	if (which != DBSETCAFILE && TDS_MAX_LOGIN_STR_SZ < strlen(value_nonull)) {
 		dbperror(NULL, SYBENTLL, 0);
 		return FAIL;
 	}
@@ -810,6 +850,15 @@ dbsetlname(LOGINREC * login, const char *value, int which)
 		break;
 	case DBSETENCRYPTION:
 		copy_ret = tds_parse_conf_section(TDS_STR_ENCRYPTION, value_nonull, login->tds_login);
+		break;
+	case DBSETCAFILE:
+		copy_ret = !!tds_dstr_copy(&login->tds_login->cafile, value_nonull);
+		login->tds_login->cafile_specified = 1;
+		login->tds_login->check_ssl_hostname = 1;
+		break;
+	case DBSETCERTIFICATEHOSTNAME:
+		if (!value_nonull[0]) return FAIL;
+		copy_ret = !!tds_dstr_copy(&login->tds_login->certificate_host_name, value_nonull);
 		break;
 	default:
 		dbperror(NULL, SYBEASUL, 0); /* Attempt to set unknown LOGINREC field */
@@ -8326,4 +8375,3 @@ dbperror(DBPROCESS *dbproc, DBINT msgno, long errnum, ...)
 	exit(EXIT_FAILURE);
 	return rc; /* not reached */
 }
-
