@@ -11,17 +11,25 @@
 .svn/
 .swiftpm/
 migrate_working_dir/
+# https://dart.dev/guides/libraries/private-files
+# Created by `dart pub`
+.dart_tool/
 
 # IntelliJ related
 *.iml
 *.ipr
 *.iws
 .idea/
+# Avoid committing pubspec.lock for library packages; see
+# https://dart.dev/guides/libraries/private-files#pubspeclock.
+pubspec.lock
 
 # The .vscode folder contains launch configuration and tasks you configure in
 # VS Code which you may wish to be included in version control, so this line
 # is commented out by default.
 #.vscode/
+# FVM Version Cache
+.fvm/
 
 # Flutter/Dart/Pub related
 # Libraries should not include pubspec.lock, per https://dart.dev/guides/libraries/private-files#pubspeclock.
@@ -31,3 +39,13 @@ migrate_working_dir/
 .flutter-plugins-dependencies
 /build/
 /coverage/
+# Local credentials and native build intermediates
+.env
+.env.*
+!.env.example
+build/
+out-*/
+__pycache__/
+# Generated remnants of platform projects archived under todo/.
+/example/ios/
+/example/macos/

@@ -1,3 +1,3 @@
 library;
 
-export 'package:mssql/mssql.dart';
+export 'packages/mssql/mssql.dart';
