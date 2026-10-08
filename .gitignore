@@ -1,0 +1,16 @@
+# Default generated
+.dart_tool/
+build/
+pubspec.lock
+
+# Created by `dart doc`
+doc/api/
+
+# IntelliJ
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# Mac
+.DS_Store

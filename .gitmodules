@@ -1,0 +1,4 @@
+[submodule "dependencies/freetds"]
+	path = dependencies/freetds
+	url = https://github.com/FreeTDS/freetds.git
+	branch = tags/v1.5.16
